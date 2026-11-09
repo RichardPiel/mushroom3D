@@ -298,7 +298,7 @@ class IncubatorController:
                 "nozzle_actual": self.nozzle_actual,
                 "last_photo": self.last_photo,
                 "photo_count": self.photo_count,
-                "metrics_csv": "/metrics.csv" if METRICS_CSV.is_file() else "",
+                "metrics_csv": "/api/metrics.csv",
                 "uptime_s": (now - self.started_at) if self.started_at else 0,
                 "stream_proxy": "/api/camera.jpg",
                 "bme680": dict(self.bme680),
@@ -824,7 +824,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="body">
         <p class="hint" style="margin-top:0">Photos + journal CSV (températures, consigne, ventilation) à chaque télémétrie.</p>
         <div class="actions" style="margin-top:0;margin-bottom:10px">
-          <a class="btn-ghost" id="btnMetrics" href="/metrics.csv" download="metrics.csv" style="text-decoration:none;display:inline-block">Télécharger metrics.csv</a>
+          <button type="button" class="btn-gold" id="btnMetrics">Télécharger metrics.csv</button>
         </div>
         <div class="gallery" id="gallery"></div>
       </div>
@@ -945,6 +945,25 @@ async function refreshGallery() {
     `<a href="${p.url}" target="_blank" title="${p.name}"><img src="${p.url}" alt="${p.name}" loading="lazy" /></a>`
   ).join("") || "<p class='hint'>Aucune photo pour l'instant.</p>";
 }
+
+$("btnMetrics").onclick = async () => {
+  const r = await fetch("/api/metrics.csv", { credentials: "same-origin" });
+  if (r.status === 401) { location.href = "/login"; return; }
+  if (!r.ok) {
+    $("err").textContent = "CSV indisponible";
+    $("err").classList.add("show");
+    return;
+  }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "metrics.csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};
 
 function bumpCam() {
   $("cam").src = "/api/camera.jpg?t=" + Date.now();
@@ -1221,9 +1240,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/photos":
             return self._json(200, {"photos": CTRL.list_photos()})
 
-        if path == "/metrics.csv":
+        if path in ("/metrics.csv", "/api/metrics.csv"):
             if not METRICS_CSV.is_file():
-                CTRL._ensure_metrics_csv()
+                with CTRL.lock:
+                    CTRL._ensure_metrics_csv()
             data = METRICS_CSV.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "text/csv; charset=utf-8")
