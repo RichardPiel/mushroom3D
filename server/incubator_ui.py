@@ -58,6 +58,12 @@ METRICS_FIELDS = (
     "humidity_pct",
     "photo",
 )
+METRICS_WINDOWS = {
+    "5m": 5 * 60,
+    "60m": 60 * 60,
+    "24h": 24 * 60 * 60,
+}
+METRICS_SERIES = ("bed_actual_c", "consigne_c", "air_c", "humidity_pct")
 
 AUTH_PASSWORD = os.environ.get("INCUBATOR_PASSWORD", "")
 RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "")
@@ -117,6 +123,58 @@ def parse_camera_url(raw: str) -> str:
     if len(text) > 512:
         raise ValueError("URL caméra trop longue")
     return urllib.parse.urlunparse(parsed)
+
+
+def _parse_ts_utc(raw: str) -> datetime | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _float_or_none(raw: str) -> float | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def read_metrics_window(window: str = "60m", max_points: int = 480) -> dict[str, Any]:
+    """Points CSV dans la fenêtre demandée (5m / 60m / 24h), sous-échantillonnés."""
+    key = (window or "60m").strip().lower()
+    if key not in METRICS_WINDOWS:
+        raise ValueError("Fenêtre invalide (5m, 60m, 24h)")
+    span_s = METRICS_WINDOWS[key]
+    now = datetime.now(timezone.utc)
+    cutoff = now.timestamp() - span_s
+    points: list[dict[str, Any]] = []
+    if METRICS_CSV.is_file():
+        with METRICS_CSV.open("r", encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh):
+                ts = _parse_ts_utc(row.get("ts_utc", ""))
+                if ts is None or ts.timestamp() < cutoff:
+                    continue
+                item: dict[str, Any] = {"t": ts.strftime("%Y-%m-%dT%H:%M:%SZ")}
+                for field in METRICS_SERIES:
+                    item[field] = _float_or_none(row.get(field, ""))
+                points.append(item)
+    if len(points) > max_points and max_points > 1:
+        step = len(points) / max_points
+        picked = [points[int(i * step)] for i in range(max_points - 1)]
+        picked.append(points[-1])
+        points = picked
+    return {"window": key, "span_s": span_s, "count": len(points), "points": points}
 
 
 def session_token() -> str:
@@ -694,6 +752,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .gallery a { display: block; border-radius: 12px; overflow: hidden; background: #000; }
   .gallery img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
+  .seg { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+  .chart-wrap {
+    position: relative; width: 100%; height: 260px; margin-top: 8px;
+    border-radius: 12px; background: rgba(255,255,255,.03); border: 1px solid var(--line);
+  }
+  .chart-wrap canvas { width: 100%; height: 100%; display: block; }
+  .chart-legend {
+    display: flex; flex-wrap: wrap; gap: 12px 16px; margin-top: 10px;
+    font-size: .78rem; color: var(--muted);
+  }
+  .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
   footer { margin-top: 18px; color: var(--muted); font-size: .75rem; }
 </style>
 </head>
@@ -818,6 +889,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </section>
       </div>
     </div>
+
+    <section class="panel" style="margin-top:14px">
+      <h2>Historique</h2>
+      <div class="body">
+        <div class="actions" style="margin-top:0;justify-content:space-between;align-items:center">
+          <div class="seg" id="chartWindow" role="group" aria-label="Fenêtre">
+            <button type="button" class="btn-ghost" data-window="5m">5 min</button>
+            <button type="button" class="btn-ghost" data-window="60m" aria-pressed="true">60 min</button>
+            <button type="button" class="btn-ghost" data-window="24h">24 h</button>
+          </div>
+          <span class="hint" id="chartMeta" style="margin:0">—</span>
+        </div>
+        <div class="chart-wrap"><canvas id="metricsChart" width="1100" height="260"></canvas></div>
+        <div class="chart-legend">
+          <span><i class="swatch" style="background:#3ddc97"></i>Plateau</span>
+          <span><i class="swatch" style="background:#e6b35a"></i>Consigne</span>
+          <span><i class="swatch" style="background:#6ec8ff"></i>Air BME</span>
+          <span><i class="swatch" style="background:#c9a0ff"></i>Humidité %</span>
+        </div>
+      </div>
+    </section>
 
     <section class="panel" style="margin-top:14px">
       <h2>Time-lapse</h2>
@@ -965,6 +1057,131 @@ $("btnMetrics").onclick = async () => {
   URL.revokeObjectURL(url);
 };
 
+let chartWindow = "60m";
+const SERIES = [
+  { key: "bed_actual_c", color: "#3ddc97", axis: "temp" },
+  { key: "consigne_c", color: "#e6b35a", axis: "temp" },
+  { key: "air_c", color: "#6ec8ff", axis: "temp" },
+  { key: "humidity_pct", color: "#c9a0ff", axis: "hum" },
+];
+
+function niceRange(min, max, pad = 0.08) {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return { min: 0, max: 1 };
+  if (min === max) { min -= 1; max += 1; }
+  const span = max - min || 1;
+  return { min: min - span * pad, max: max + span * pad };
+}
+
+function drawMetricsChart(points) {
+  const canvas = $("metricsChart");
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 1100;
+  const cssH = canvas.clientHeight || 260;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const pad = { l: 44, r: 44, t: 16, b: 28 };
+  const w = cssW - pad.l - pad.r;
+  const h = cssH - pad.t - pad.b;
+
+  ctx.fillStyle = "rgba(255,255,255,.03)";
+  ctx.fillRect(0, 0, cssW, cssH);
+
+  if (!points.length) {
+    ctx.fillStyle = "#8d9893";
+    ctx.font = "14px Outfit, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Pas encore de données sur cette fenêtre", cssW / 2, cssH / 2);
+    return;
+  }
+
+  const temps = [];
+  const hums = [];
+  for (const p of points) {
+    for (const s of SERIES) {
+      const v = p[s.key];
+      if (v == null) continue;
+      (s.axis === "temp" ? temps : hums).push(v);
+    }
+  }
+  const tR = niceRange(Math.min(...temps, 15), Math.max(...temps, 30));
+  const hR = niceRange(Math.min(...hums, 0), Math.max(...hums, 100));
+  const xAt = (i) => pad.l + (points.length === 1 ? w / 2 : (i / (points.length - 1)) * w);
+  const yTemp = (v) => pad.t + (1 - (v - tR.min) / (tR.max - tR.min)) * h;
+  const yHum = (v) => pad.t + (1 - (v - hR.min) / (hR.max - hR.min)) * h;
+
+  ctx.strokeStyle = "rgba(255,255,255,.08)";
+  ctx.lineWidth = 1;
+  ctx.font = "11px Outfit, system-ui, sans-serif";
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#8d9893";
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + (i / 4) * h;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + w, y); ctx.stroke();
+    const tv = tR.max - (i / 4) * (tR.max - tR.min);
+    const hv = hR.max - (i / 4) * (hR.max - hR.min);
+    ctx.fillText(tv.toFixed(1), pad.l - 8, y + 3);
+    ctx.textAlign = "left";
+    ctx.fillText(hv.toFixed(0) + "%", pad.l + w + 8, y + 3);
+    ctx.textAlign = "right";
+  }
+
+  ctx.textAlign = "center";
+  const labelIdx = [0, Math.floor((points.length - 1) / 2), points.length - 1];
+  for (const i of labelIdx) {
+    const t = new Date(points[i].t);
+    const label = chartWindow === "24h"
+      ? t.toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })
+      : t.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: chartWindow === "5m" ? "2-digit" : undefined });
+    ctx.fillText(label, xAt(i), cssH - 8);
+  }
+
+  for (const s of SERIES) {
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < points.length; i++) {
+      const v = points[i][s.key];
+      if (v == null) { started = false; continue; }
+      const x = xAt(i);
+      const y = s.axis === "temp" ? yTemp(v) : yHum(v);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = s.key === "consigne_c" ? 1.5 : 2;
+    if (s.key === "consigne_c") ctx.setLineDash([5, 4]);
+    else ctx.setLineDash([]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+async function refreshChart() {
+  try {
+    const data = await api("/api/metrics?window=" + encodeURIComponent(chartWindow));
+    drawMetricsChart(data.points || []);
+    $("chartMeta").textContent = data.count
+      ? `${data.count} point${data.count > 1 ? "s" : ""}`
+      : "Aucune donnée";
+  } catch (e) {
+    $("chartMeta").textContent = String(e.message || e);
+  }
+}
+
+$("chartWindow").onclick = (ev) => {
+  const btn = ev.target.closest("button[data-window]");
+  if (!btn) return;
+  chartWindow = btn.dataset.window;
+  for (const b of $("chartWindow").querySelectorAll("button")) {
+    b.setAttribute("aria-pressed", b === btn ? "true" : "false");
+  }
+  refreshChart();
+};
+window.addEventListener("resize", () => refreshChart());
+
 function bumpCam() {
   $("cam").src = "/api/camera.jpg?t=" + Date.now();
 }
@@ -1032,9 +1249,11 @@ $("cam").onerror = () => { setTimeout(bumpCam, 2000); };
 
 refreshStatus();
 refreshGallery();
+refreshChart();
 setInterval(refreshStatus, 4000);
 setInterval(bumpCam, 2500);
 setInterval(refreshGallery, 15000);
+setInterval(refreshChart, 15000);
 </script>
 </body>
 </html>
@@ -1239,6 +1458,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/photos":
             return self._json(200, {"photos": CTRL.list_photos()})
+
+        if path == "/api/metrics":
+            window = (qs.get("window") or ["60m"])[0]
+            try:
+                return self._json(200, read_metrics_window(window))
+            except ValueError as exc:
+                return self._json(400, {"error": str(exc)})
 
         if path in ("/metrics.csv", "/api/metrics.csv"):
             if not METRICS_CSV.is_file():
