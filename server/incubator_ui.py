@@ -12,6 +12,7 @@ proxy le flux si l'URL lui est joignable (LAN via VPN / Tailscale, etc.).
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import hmac
 import json
@@ -25,6 +26,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -38,8 +40,24 @@ UI_PORT = int(os.environ.get("UI_PORT", "8765"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).resolve().parent))
 CONFIG_PATH = DATA_DIR / "config.json"
 OUTPUT_DIR = DATA_DIR / "timelapse_champignons"
+METRICS_CSV = OUTPUT_DIR / "metrics.csv"
 IMAGE_PREFIX = "champignon"
 IMAGE_EXT = ".jpg"
+METRICS_FIELDS = (
+    "ts_utc",
+    "bed_actual_c",
+    "bed_target_c",
+    "consigne_c",
+    "heater_on",
+    "incubator_running",
+    "vent_mode",
+    "vent_on",
+    "vent_speed_pct",
+    "vent_actual_pct",
+    "air_c",
+    "humidity_pct",
+    "photo",
+)
 
 AUTH_PASSWORD = os.environ.get("INCUBATOR_PASSWORD", "")
 RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "")
@@ -194,11 +212,51 @@ class IncubatorController:
 
     def start(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        self._ensure_metrics_csv()
         self._refresh_photo_count()
 
     def shutdown(self) -> None:
         self._stop.set()
         self._cmd_event.set()
+
+    def _ensure_metrics_csv(self) -> None:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        if METRICS_CSV.is_file():
+            return
+        with METRICS_CSV.open("w", encoding="utf-8", newline="") as fh:
+            csv.DictWriter(fh, fieldnames=METRICS_FIELDS).writeheader()
+
+    def _append_metrics(self, *, photo: str | None = None) -> None:
+        """Append one CSV row from current state. Caller holds self.lock."""
+        try:
+            self._ensure_metrics_csv()
+            row = {
+                "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "bed_actual_c": "" if self.bed_actual is None else f"{self.bed_actual:.2f}",
+                "bed_target_c": "" if self.bed_target is None else f"{self.bed_target:.2f}",
+                "consigne_c": f"{self.target_temp:.2f}",
+                "heater_on": int(bool(self.heater_on)),
+                "incubator_running": int(bool(self.incubator_running)),
+                "vent_mode": self.vent_mode,
+                "vent_on": int(bool(self.vent_on)),
+                "vent_speed_pct": self.vent_speed,
+                "vent_actual_pct": "" if self.vent_actual is None else f"{self.vent_actual:.1f}",
+                "air_c": (
+                    ""
+                    if self.bme680.get("temperature_c") is None
+                    else f"{float(self.bme680['temperature_c']):.2f}"
+                ),
+                "humidity_pct": (
+                    ""
+                    if self.bme680.get("humidity_pct") is None
+                    else f"{float(self.bme680['humidity_pct']):.1f}"
+                ),
+                "photo": photo or "",
+            }
+            with METRICS_CSV.open("a", encoding="utf-8", newline="") as fh:
+                csv.DictWriter(fh, fieldnames=METRICS_FIELDS).writerow(row)
+        except OSError:
+            log.exception("Écriture CSV métriques impossible")
 
     def _enqueue(self, cmd: dict[str, Any]) -> str:
         cmd_id = cmd.get("id") or f"cmd_{secrets.token_hex(8)}"
@@ -240,6 +298,7 @@ class IncubatorController:
                 "nozzle_actual": self.nozzle_actual,
                 "last_photo": self.last_photo,
                 "photo_count": self.photo_count,
+                "metrics_csv": "/metrics.csv" if METRICS_CSV.is_file() else "",
                 "uptime_s": (now - self.started_at) if self.started_at else 0,
                 "stream_proxy": "/api/camera.jpg",
                 "bme680": dict(self.bme680),
@@ -316,6 +375,7 @@ class IncubatorController:
             if "light_on" in desired:
                 self.light_on = bool(desired["light_on"])
 
+            self._append_metrics()
             return {"ok": True}
 
     def pop_commands(self, wait_s: float = COMMAND_LONG_POLL_S) -> list[dict[str, Any]]:
@@ -468,6 +528,7 @@ class IncubatorController:
         with self.lock:
             self.last_photo = name
             self._refresh_photo_count()
+            self._append_metrics(photo=name)
         return {"ok": True, "file": name, "url": f"/photos/{name}"}
 
     def grab_jpeg_bytes(self) -> bytes | None:
@@ -761,6 +822,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <section class="panel" style="margin-top:14px">
       <h2>Time-lapse</h2>
       <div class="body">
+        <p class="hint" style="margin-top:0">Photos + journal CSV (températures, consigne, ventilation) à chaque télémétrie.</p>
+        <div class="actions" style="margin-top:0;margin-bottom:10px">
+          <a class="btn-ghost" id="btnMetrics" href="/metrics.csv" download="metrics.csv" style="text-decoration:none;display:inline-block">Télécharger metrics.csv</a>
+        </div>
         <div class="gallery" id="gallery"></div>
       </div>
     </section>
@@ -1155,6 +1220,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/photos":
             return self._json(200, {"photos": CTRL.list_photos()})
+
+        if path == "/metrics.csv":
+            if not METRICS_CSV.is_file():
+                CTRL._ensure_metrics_csv()
+            data = METRICS_CSV.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="metrics.csv"')
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return self._write(data)
 
         if path == "/api/camera.jpg":
             data = CTRL.grab_jpeg_bytes()
