@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "auth": {
+    "header": "Authorization",
+    "scheme": "Bearer",
+    "env": "RELAY_TOKEN"
+  },
+  "endpoints": {
+    "telemetry": {
+      "method": "POST",
+      "path": "/api/link/telemetry",
+      "interval_s": 5,
+      "body": {
+        "ts": 1710000000,
+        "printer": {
+          "connected": true,
+          "ip": "192.168.1.20",
+          "machine_name": "Centauri Carbon",
+          "firmware": "V1.1.40",
+          "bed_actual": 52.1,
+          "bed_target": 52.0,
+          "nozzle_actual": 24.0,
+          "light_on": false,
+          "box_fan": 0,
+          "camera_url": "http://192.168.1.20:3031/video"
+        },
+        "bme680": {
+          "ok": true,
+          "temperature_c": 24.5,
+          "humidity_pct": 62.0,
+          "pressure_hpa": 1013.2,
+          "gas_ohms": 45000
+        },
+        "desired": {
+          "heater_on": true,
+          "target_temp": 52.0,
+          "light_on": false,
+          "vent_mode": "off",
+          "vent_speed": 60,
+          "vent_interval_s": 1800,
+          "vent_duration_s": 120,
+          "vent_on": false
+        }
+      }
+    },
+    "commands": {
+      "method": "GET",
+      "path": "/api/link/commands",
+      "long_poll_s": 25,
+      "response": {
+        "commands": [
+          {
+            "id": "cmd_01HXYZ",
+            "type": "heater_set",
+            "temp": 52.0
+          },
+          {
+            "id": "cmd_01HYZA",
+            "type": "heater_off"
+          },
+          {
+            "id": "cmd_01HZAB",
+            "type": "light",
+            "on": true
+          },
+          {
+            "id": "cmd_01HZAC",
+            "type": "vent",
+            "mode": "cycle",
+            "speed": 60,
+            "interval_s": 1800,
+            "duration_s": 120
+          },
+          {
+            "id": "cmd_01HZAD",
+            "type": "incubator_start",
+            "temp": 52.0
+          },
+          {
+            "id": "cmd_01HZAE",
+            "type": "incubator_stop",
+            "turn_off_heat": false
+          },
+          {
+            "id": "cmd_01HZAF",
+            "type": "camera_url",
+            "url": "http://192.168.1.20:3031/video"
+          }
+        ]
+      }
+    },
+    "ack": {
+      "method": "POST",
+      "path": "/api/link/ack",
+      "body": {
+        "results": [
+          {
+            "id": "cmd_01HXYZ",
+            "ok": true,
+            "error": ""
+          }
+        ]
+      }
+    }
+  }
+}
