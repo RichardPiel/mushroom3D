@@ -1,8 +1,12 @@
-# Variante locale (build depuis ce dossier). Sur Dokploy, préférer le compose à la racine.
+# Ne pas utiliser ce fichier dans Dokploy.
+# Dokploy : compose à la racine du dépôt → ../docker-compose.yml
+# (sinon Dokploy traite ce chemin comme un dossier et échoue sur .env)
 services:
   incubator:
     build: .
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       DATA_DIR: /data
       UI_PORT: "8765"

@@ -10,13 +10,16 @@
 
 namespace {
 SdcpClient printer(PRINTER_IP);
-ServerLink link(SERVER_BASE_URL, RELAY_TOKEN);
+ServerLink server_link(SERVER_BASE_URL, RELAY_TOKEN);
 DesiredState desired;
 String camera_url = CAMERA_URL;
 
 uint32_t last_telemetry_ms = 0;
 uint32_t last_heater_ms = 0;
 uint32_t last_temp_ms = 0;
+uint32_t last_ui_ms = 0;
+BmeReading last_bme;
+bool last_link_ok = false;
 uint32_t vent_cycle_start_ms = 0;
 uint32_t vent_off_at_ms = 0;
 uint32_t last_vent_cmd_ms = 0;
@@ -159,7 +162,7 @@ void handleCommand(JsonObjectConst cmd, JsonObject result) {
 
 void pollCommands() {
   // Attente courte pour laisser tourner télémétrie / keepalive ; le serveur accepte jusqu'à 25 s.
-  LinkResult res = link.getCommands(3);
+  LinkResult res = server_link.getCommands(3);
   if (!res.ok) {
     return;
   }
@@ -177,14 +180,14 @@ void pollCommands() {
     JsonObject result = results.add<JsonObject>();
     handleCommand(cmd, result);
   }
-  link.postAck(results);
+  server_link.postAck(results);
 }
 
 void safetyWatchdog() {
   if (!desired.heater_on) {
     return;
   }
-  uint32_t last = link.lastOkMs();
+  uint32_t last = server_link.lastOkMs();
   if (last == 0) {
     return;
   }
@@ -244,10 +247,15 @@ void loop() {
 
   if (now - last_telemetry_ms >= TELEMETRY_INTERVAL_MS) {
     last_telemetry_ms = now;
-    BmeReading bme = bme680Read();
+    last_bme = bme680Read();
     LinkResult tel =
-        link.postTelemetry(printer.state(), bme, desired, camera_url.c_str());
-    uiUpdate(printer.state(), bme, tel.ok, desired.target_temp);
+        server_link.postTelemetry(printer.state(), last_bme, desired, camera_url.c_str());
+    last_link_ok = tel.ok;
+  }
+
+  if (now - last_ui_ms >= 1000) {
+    last_ui_ms = now;
+    uiUpdate(printer.state(), last_bme, last_link_ok, desired.target_temp);
   }
 
   pollCommands();

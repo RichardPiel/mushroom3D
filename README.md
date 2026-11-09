@@ -18,11 +18,16 @@ INCUBATOR_PASSWORD='…' RELAY_TOKEN='…' CAMERA_URL='http://192.168.1.20:3031/
 
 ### Dokploy
 
-Ne pas utiliser **Nixpacks**. Créer une appli **Docker Compose** :
+L’appli actuelle `incubateur-ui-…` est une **Application** (chemin
+`/etc/dokploy/applications/…`). Il faut un service **Compose** à part.
 
-- Fichier Compose : `docker-compose.yml` (racine du dépôt)
-- Variables : `INCUBATOR_PASSWORD`, `RELAY_TOKEN`, optionnellement `CAMERA_URL`
-- Domaine HTTPS → service `incubator`, port conteneur **8765**
+1. Projet → **Create Service** → **Compose** (type Docker Compose)
+2. Provider GitHub, repo `mushroom3D`, branche `main`
+3. **Compose Path** : `./docker-compose.yml` (comme dans la [doc Dokploy](https://docs.dokploy.com/docs/core/docker-compose/example), sans slash final)
+4. Variables : `INCUBATOR_PASSWORD`, `RELAY_TOKEN`, optionnellement `CAMERA_URL`
+5. Domaines → service `incubator`, port **8765**
+
+Ne pas réutiliser l’ancienne Application Nixpacks/Dockerfile.
 
 L’URL du flux MJPEG se règle aussi dans l’interface (**Caméra**). Elle doit être **joignable depuis le serveur** (VPN / Tailscale). Exemple Centauri : `http://<IP>:3031/video`.
 

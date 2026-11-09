@@ -676,14 +676,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </div>
           <div class="stats" style="margin-top:8px">
             <div class="stat">
-              <div class="label">Pression</div>
-              <div class="value" id="bmePress">—<small> hPa</small></div>
-            </div>
-            <div class="stat">
-              <div class="label">Gaz</div>
-              <div class="value" id="bmeGas">—<small> Ω</small></div>
-            </div>
-            <div class="stat">
               <div class="label">Photos</div>
               <div class="value" id="photoCount">0</div>
             </div>
@@ -831,8 +823,6 @@ function applyStatus(s) {
   const b = s.bme680 || {};
   $("bmeTemp").innerHTML = fmtNum(b.temperature_c) + "<small> °C</small>";
   $("bmeHum").innerHTML = fmtNum(b.humidity_pct, 0) + "<small> %</small>";
-  $("bmePress").innerHTML = fmtNum(b.pressure_hpa, 1) + "<small> hPa</small>";
-  $("bmeGas").innerHTML = (b.gas_ohms != null ? Math.round(b.gas_ohms) : "—") + "<small> Ω</small>";
 
   setIfIdle("temp", s.target_temp);
   setIfIdle("interval", s.photo_interval_s);
