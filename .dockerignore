@@ -1,0 +1,9 @@
+.git
+__pycache__
+firmware
+protocol
+timelapse_champignons
+*.md
+*.json
+server/__pycache__
+.pio

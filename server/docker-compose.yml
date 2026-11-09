@@ -1,6 +1,4 @@
-# Dokploy : domaine HTTPS sur le service `incubator`, port conteneur 8765.
-# La carte ESP32 (salon) ouvre le lien vers ce serveur. Aucun accès LAN à l'imprimante.
-# CAMERA_URL doit être joignable depuis ce serveur (ex. Tailscale), pas seulement depuis le salon.
+# Variante locale (build depuis ce dossier). Sur Dokploy, préférer le compose à la racine.
 services:
   incubator:
     build: .

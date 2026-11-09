@@ -16,7 +16,13 @@ INCUBATOR_PASSWORD='…' RELAY_TOKEN='…' CAMERA_URL='http://192.168.1.20:3031/
   python3 incubator_ui.py
 ```
 
-Dokploy : Compose depuis `server/`, variables `INCUBATOR_PASSWORD`, `RELAY_TOKEN`, optionnellement `CAMERA_URL`. Domaine HTTPS → port conteneur **8765**.
+### Dokploy
+
+Ne pas utiliser **Nixpacks**. Créer une appli **Docker Compose** :
+
+- Fichier Compose : `docker-compose.yml` (racine du dépôt)
+- Variables : `INCUBATOR_PASSWORD`, `RELAY_TOKEN`, optionnellement `CAMERA_URL`
+- Domaine HTTPS → service `incubator`, port conteneur **8765**
 
 L’URL du flux MJPEG se règle aussi dans l’interface (**Caméra**). Elle doit être **joignable depuis le serveur** (VPN / Tailscale). Exemple Centauri : `http://<IP>:3031/video`.
 
