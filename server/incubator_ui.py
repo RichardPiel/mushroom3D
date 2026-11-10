@@ -100,6 +100,10 @@ AIR_SANE_MAX = 70.0
 BED_AUTO_MIN = 0.0
 BED_AUTO_MAX = 60.0
 BED_SLEW_C = 2.0
+AIR_LOOKAHEAD_S = 180.0
+AIR_RATE_MIN_SPAN_S = 45.0
+AIR_RATE_MAX = 0.03
+AIR_FORECAST_MIN_C = 0.2
 HEAT_I_MAX = 12.0 / AIR_KI
 HEAT_I_MIN = -15.0 / AIR_KI
 
@@ -376,6 +380,8 @@ class IncubatorController:
         self._heat_i = 0.0
         self._heat_tick_at = 0.0
         self._bed_command: float | None = None
+        self._air_hist: deque[tuple[float, float]] = deque()
+        self._air_rate = 0.0
         self._air_sane = True
         self._cool_vent = False
         self.photo_interval_s = _cfg_int(cfg, "photo_interval_s", DEFAULT_PHOTO_INTERVAL_S)
@@ -786,23 +792,58 @@ class IncubatorController:
             return None
         return temp
 
+    def _reset_air_trend(self) -> None:
+        """Caller holds self.lock."""
+        self._air_hist.clear()
+        self._air_rate = 0.0
+
+    def _note_air(self, air: float) -> None:
+        """Caller holds self.lock. Pente du BME sur la fenêtre récente."""
+        now = time.monotonic()
+        self._air_hist.append((now, air))
+        cutoff = now - AIR_LOOKAHEAD_S
+        while self._air_hist and self._air_hist[0][0] < cutoff:
+            self._air_hist.popleft()
+        if len(self._air_hist) < 2:
+            self._air_rate = 0.0
+            return
+        started, first = self._air_hist[0]
+        span = now - started
+        if span < AIR_RATE_MIN_SPAN_S:
+            self._air_rate = 0.0
+            return
+        rate = (air - first) / span
+        self._air_rate = max(-AIR_RATE_MAX, min(AIR_RATE_MAX, rate))
+
     def _band_edge(self, air: float) -> float | None:
-        """Bord de plage à rejoindre, ou None si le BME est déjà dedans."""
+        """Bord déjà franchi, ou None si le BME est dans la plage."""
         if air < self.culture_temp_min:
             return self.culture_temp_min
         if air > self.culture_temp_max:
             return self.culture_temp_max
         return None
 
+    def _forecast_edge(self, air: float) -> tuple[float | None, float]:
+        """Bord vers lequel la pente actuelle emmène le BME, et la température prévue."""
+        pred = air + self._air_rate * AIR_LOOKAHEAD_S
+        if self._air_rate > 0 and pred - self.culture_temp_max >= AIR_FORECAST_MIN_C:
+            return self.culture_temp_max, pred
+        if self._air_rate < 0 and self.culture_temp_min - pred >= AIR_FORECAST_MIN_C:
+            return self.culture_temp_min, pred
+        return None, pred
+
     def _auto_bed_now(self) -> float:
         """Caller holds self.lock. Consigne plateau immédiate, sans avancer l'intégrale."""
         air = self._air_c()
-        if air is None:
+        if air is None or air >= self.culture_temp_max:
             return 0.0
-        edge = self._band_edge(air)
-        if edge is None or air > self.culture_temp_max:
+        if air < self.culture_temp_min:
+            bed, _integral = air_bed_command(self.culture_temp_min, air, self._heat_i, 0.0)
+            return bed
+        edge, pred = self._forecast_edge(air)
+        if edge != self.culture_temp_min:
             return 0.0
-        bed, _integral = air_bed_command(edge, air, self._heat_i, 0.0)
+        bed, _integral = air_bed_command(edge, pred, 0.0, 0.0)
         return bed
 
     def _control_bed(self) -> None:
@@ -812,6 +853,7 @@ class IncubatorController:
             return
         air = self._air_c()
         if air is None:
+            self._reset_air_trend()
             if not self.heat_forced and self._air_sane:
                 log.warning(
                     "BME indisponible (%s) — plateau non modifié",
@@ -820,10 +862,16 @@ class IncubatorController:
                 self._air_sane = False
             return
         self._air_sane = True
+        self._note_air(air)
         self._sync_cool_vent(air)
         if self.heat_forced:
             return
         edge = self._band_edge(air)
+        forecast = False
+        pred = air
+        if edge is None:
+            edge, pred = self._forecast_edge(air)
+            forecast = edge is not None
         if edge is None:
             self._heat_i = 0.0
             return
@@ -833,9 +881,17 @@ class IncubatorController:
         else:
             dt = min(30.0, max(0.5, now - self._heat_tick_at))
         self._heat_tick_at = now
-        bed, self._heat_i = air_bed_command(edge, air, self._heat_i, dt)
-        if air > self.culture_temp_max and self._bed_command is not None:
-            bed = min(bed, self._bed_command)
+        if forecast:
+            bed, _integral = air_bed_command(edge, pred, 0.0, 0.0)
+            self._heat_i = 0.0
+            if edge == self.culture_temp_max:
+                bed = 0.0 if self._bed_command is None else min(bed, self._bed_command)
+            elif self._bed_command is not None:
+                bed = max(bed, self._bed_command)
+        else:
+            bed, self._heat_i = air_bed_command(edge, air, self._heat_i, dt)
+            if air > self.culture_temp_max and self._bed_command is not None:
+                bed = min(bed, self._bed_command)
         if self._bed_command is not None:
             bed = min(self._bed_command + BED_SLEW_C, max(self._bed_command - BED_SLEW_C, bed))
             bed = round(bed, 1)
@@ -844,8 +900,9 @@ class IncubatorController:
         self.heater_on = bed > 0
         self._queue_bed(bed)
         log.info(
-            "Plateau %.1f °C (BME %.1f °C, plage %.1f–%.1f °C)",
+            "Plateau %.1f °C (%sBME %.1f °C, plage %.1f–%.1f °C)",
             bed,
+            f"prévu {pred:.1f} °C, " if forecast else "",
             air,
             self.culture_temp_min,
             self.culture_temp_max,
@@ -951,6 +1008,7 @@ class IncubatorController:
             self._ensure_light(False, force=True)
             self._drop_bed_commands()
             self._bed_command = 0.0
+            self._reset_air_trend()
             self._enqueue({"type": "heater_off"})
             self._enqueue(
                 {
@@ -1091,6 +1149,7 @@ class IncubatorController:
             self._cool_vent = False
             self._vent_saved = True
             self.light_mode = "manual"
+            self._reset_air_trend()
             self._persist_setpoints()
             _save_config({"light_mode": "manual"})
             self._enqueue({"type": "incubator_stop", "turn_off_heat": bool(turn_off_heat)})
@@ -1601,7 +1660,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <button type="button" class="btn-ghost" id="btnStopKeep">Pause</button>
                 <button type="button" class="btn-danger" id="btnOff">Éteindre</button>
               </div>
-              <p class="hint">La plage min–max est la consigne du BME. En dessous, le plateau chauffe (plafond 60 °C). Au-dessus, il baisse et la ventilation reste allumée. Dedans, on garde l'état en cours. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
+              <p class="hint">La plage min–max est la consigne du BME. S'il descend vers le minimum, le plateau chauffe avant de l'atteindre. S'il monte vers le maximum, le plateau baisse avant. Au-delà du maximum, la ventilation reste allumée. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
               <button type="button" class="btn-ghost" id="btnHeatAuto" hidden>Reprendre la plage</button>
             </div>
           </div>
