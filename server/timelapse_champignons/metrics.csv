@@ -1,0 +1,5 @@
+ts_utc,bed_actual_c,bed_target_c,consigne_c,heater_on,incubator_running,vent_mode,vent_on,vent_speed_pct,vent_actual_pct,air_c,chamber_c,humidity_pct,light_on,photo
+2026-11-10T09:48:50Z,,,22.00,0,0,off,0,60,,,,,0,champignon_0001.jpg
+2026-11-10T09:50:06Z,,,22.00,0,0,cycle,1,60,,,,,0,
+2026-11-10T09:50:07Z,,,22.00,0,0,off,0,60,,,,,0,
+2026-11-10T09:55:31Z,,,22.00,1,1,cycle,1,60,,,,,0,champignon_0002.jpg
