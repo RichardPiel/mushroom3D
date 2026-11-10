@@ -89,17 +89,17 @@ DEFAULT_VENT_ON_S = 120
 DEFAULT_SUN_LAT = 48.8566
 DEFAULT_SUN_LON = 2.3522
 SUN_UP_ELEVATION_DEG = -0.833
-# Asservissement plateau ← chambre (incubateur allumé, sans forçage).
-CHAMBER_KP = 2.0
-CHAMBER_KI = 0.004
-CHAMBER_DEADBAND_C = 0.3
-CHAMBER_SANE_MIN = 5.0
-CHAMBER_SANE_MAX = 70.0
+# Asservissement plateau ← température BME (incubateur allumé, sans forçage).
+AIR_KP = 2.0
+AIR_KI = 0.004
+AIR_DEADBAND_C = 0.3
+AIR_SANE_MIN = 5.0
+AIR_SANE_MAX = 70.0
 BED_AUTO_MIN = 0.0
 BED_AUTO_MAX = 60.0
 BED_SLEW_C = 2.0
-HEAT_I_MAX = 12.0 / CHAMBER_KI
-HEAT_I_MIN = -15.0 / CHAMBER_KI
+HEAT_I_MAX = 12.0 / AIR_KI
+HEAT_I_MIN = -15.0 / AIR_KI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -237,26 +237,26 @@ def solar_elevation_deg(latitude: float, longitude: float, when: datetime) -> fl
     return math.degrees(math.asin(sine))
 
 
-def chamber_bed_command(
-    target_c: float, chamber_c: float, integral: float, dt_s: float
+def air_bed_command(
+    target_c: float, air_c: float, integral: float, dt_s: float
 ) -> tuple[float, float]:
-    """Consigne plateau pour amener la chambre sur target_c.
+    """Consigne plateau pour amener le BME sur target_c.
 
     Retourne (plateau_°C, intégrale). Le plateau automatique reste dans
     BED_AUTO_MIN…BED_AUTO_MAX ; un forçage manuel peut dépasser ce plafond.
     """
-    error = float(target_c) - float(chamber_c)
+    error = float(target_c) - float(air_c)
     integral = float(integral)
-    if abs(error) >= CHAMBER_DEADBAND_C:
+    if abs(error) >= AIR_DEADBAND_C:
         integral += error * max(0.0, float(dt_s))
         integral = max(HEAT_I_MIN, min(HEAT_I_MAX, integral))
-        bed = float(target_c) + CHAMBER_KP * error + CHAMBER_KI * integral
+        bed = float(target_c) + AIR_KP * error + AIR_KI * integral
     else:
-        bed = float(target_c) + CHAMBER_KI * integral
-    if bed > BED_AUTO_MAX and error > 0 and abs(error) >= CHAMBER_DEADBAND_C:
+        bed = float(target_c) + AIR_KI * integral
+    if bed > BED_AUTO_MAX and error > 0 and abs(error) >= AIR_DEADBAND_C:
         integral -= error * max(0.0, float(dt_s))
         bed = BED_AUTO_MAX
-    elif bed < BED_AUTO_MIN and error < 0 and abs(error) >= CHAMBER_DEADBAND_C:
+    elif bed < BED_AUTO_MIN and error < 0 and abs(error) >= AIR_DEADBAND_C:
         integral -= error * max(0.0, float(dt_s))
         bed = BED_AUTO_MIN
     bed = max(BED_AUTO_MIN, min(BED_AUTO_MAX, bed))
@@ -374,7 +374,7 @@ class IncubatorController:
         self._heat_i = 0.0
         self._heat_tick_at = 0.0
         self._bed_command: float | None = None
-        self._chamber_sane = True
+        self._air_sane = True
         self.photo_interval_s = _cfg_int(cfg, "photo_interval_s", DEFAULT_PHOTO_INTERVAL_S)
         if not (10 <= self.photo_interval_s <= 86400):
             self.photo_interval_s = int(DEFAULT_PHOTO_INTERVAL_S)
@@ -653,8 +653,7 @@ class IncubatorController:
                 self.bed_target = float(printer["bed_target"])
             if printer.get("nozzle_actual") is not None:
                 self.nozzle_actual = float(printer["nozzle_actual"])
-            saw_chamber = printer.get("chamber_c") is not None
-            if saw_chamber:
+            if printer.get("chamber_c") is not None:
                 self.chamber_c = float(printer["chamber_c"])
             if printer.get("chamber_target_c") is not None:
                 self.chamber_target_c = float(printer["chamber_target_c"])
@@ -712,7 +711,7 @@ class IncubatorController:
                 except (TypeError, ValueError):
                     pass
 
-            if saw_chamber:
+            if bme.get("ok") and bme.get("temperature_c") is not None:
                 self._control_bed()
             self._append_metrics()
             return {"ok": True}
@@ -765,34 +764,47 @@ class IncubatorController:
                 return
         self._enqueue({"type": kind, "temp": temp_c})
 
+    def _air_c(self) -> float | None:
+        """Caller holds self.lock. Température BME utilisable pour le pilotage."""
+        if not self.bme680.get("ok"):
+            return None
+        try:
+            temp = float(self.bme680.get("temperature_c"))
+        except (TypeError, ValueError):
+            return None
+        if not (AIR_SANE_MIN <= temp <= AIR_SANE_MAX):
+            return None
+        return temp
+
     def _auto_bed_now(self) -> float:
         """Caller holds self.lock. Consigne plateau immédiate, sans avancer l'intégrale."""
-        chamber = self.chamber_c
-        if chamber is None or not (CHAMBER_SANE_MIN <= chamber <= CHAMBER_SANE_MAX):
+        air = self._air_c()
+        if air is None:
             return round(max(BED_AUTO_MIN, min(BED_AUTO_MAX, self.target_temp)), 1)
-        bed, _integral = chamber_bed_command(self.target_temp, chamber, self._heat_i, 0.0)
+        bed, _integral = air_bed_command(self.target_temp, air, self._heat_i, 0.0)
         return bed
 
     def _control_bed(self) -> None:
-        """Caller holds self.lock. Ajuste le plateau d'après la chambre."""
+        """Caller holds self.lock. Ajuste le plateau d'après le BME."""
         if not self.incubator_running or self.heat_forced:
             return
-        chamber = self.chamber_c
-        if chamber is None:
+        air = self._air_c()
+        if air is None:
+            if self._air_sane:
+                log.warning(
+                    "BME indisponible (%s) — plateau non modifié",
+                    self.bme680.get("temperature_c"),
+                )
+                self._air_sane = False
             return
         now = time.monotonic()
         if self._heat_tick_at <= 0:
             dt = 5.0
         else:
             dt = min(30.0, max(0.5, now - self._heat_tick_at))
-        if not (CHAMBER_SANE_MIN <= chamber <= CHAMBER_SANE_MAX):
-            if self._chamber_sane:
-                log.warning("Chambre %.1f °C hors plage utile — plateau non modifié", chamber)
-                self._chamber_sane = False
-            return
-        self._chamber_sane = True
+        self._air_sane = True
         self._heat_tick_at = now
-        bed, self._heat_i = chamber_bed_command(self.target_temp, chamber, self._heat_i, dt)
+        bed, self._heat_i = air_bed_command(self.target_temp, air, self._heat_i, dt)
         if self._bed_command is not None:
             bed = min(self._bed_command + BED_SLEW_C, max(self._bed_command - BED_SLEW_C, bed))
             bed = round(bed, 1)
@@ -801,9 +813,9 @@ class IncubatorController:
         self.heater_on = bed > 0
         self._queue_bed(bed)
         log.info(
-            "Plateau %.1f °C (chambre %.1f °C, consigne %.1f °C)",
+            "Plateau %.1f °C (BME %.1f °C, consigne %.1f °C)",
             bed,
-            chamber,
+            air,
             self.target_temp,
         )
 
@@ -816,8 +828,8 @@ class IncubatorController:
             return None
         return temp_c
 
-    def set_chamber_target(self, temp_c: float) -> dict[str, Any]:
-        """Consigne de la chambre. Le plateau n'est pas forcé."""
+    def set_air_target(self, temp_c: float) -> dict[str, Any]:
+        """Consigne du BME. Le plateau n'est pas forcé."""
         with self.lock:
             parsed = self._parse_temp(temp_c)
             if parsed is None:
@@ -827,7 +839,7 @@ class IncubatorController:
             self._target_saved = True
             self._persist_setpoints()
             self.last_error = ""
-            if self.incubator_running and not self.heat_forced and self.chamber_c is not None:
+            if self.incubator_running and not self.heat_forced and self._air_c() is not None:
                 self._control_bed()
             return self.status()
 
@@ -848,7 +860,7 @@ class IncubatorController:
             return self.status()
 
     def release_heat_force(self) -> dict[str, Any]:
-        """Rend la main à la chambre si l'incubateur tourne."""
+        """Rend la main au BME si l'incubateur tourne."""
         with self.lock:
             self.heat_forced = False
             self._heat_i = 0.0
@@ -859,7 +871,7 @@ class IncubatorController:
                 bed = self._auto_bed_now()
                 self.heater_on = bed > 0
                 self._queue_bed(bed)
-                log.info("Pilotage chambre repris, plateau %.1f °C", bed)
+                log.info("Pilotage BME repris, plateau %.1f °C", bed)
             return self.status()
 
     def heater_off(self) -> dict[str, Any]:
@@ -1446,7 +1458,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <section class="kpi" aria-label="Mesures">
       <div class="kpi-card"><div class="label">Plateau</div><div class="value" id="bedActual">—<small> °C</small></div><div class="band" id="bedCmd"></div></div>
-      <div class="kpi-card"><div class="label">Consigne</div><div class="value" id="bedTarget">—<small> °C</small></div></div>
+      <div class="kpi-card"><div class="label">Consigne BME</div><div class="value" id="bedTarget">—<small> °C</small></div></div>
       <div class="kpi-card"><div class="label">Chambre</div><div class="value" id="chamberTemp">—<small> °C</small></div></div>
       <div class="kpi-card" id="kpiCultureTemp">
         <div class="label">Température culture</div>
@@ -1483,9 +1495,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="body">
           <div class="set-list">
             <div class="set-row">
-              <span class="name">Chambre °C</span>
-              <input id="temp" type="number" min="0" max="110" step="0.5" value="22" title="Consigne de la chambre" />
-              <button type="button" class="btn-gold btn-icon" id="btnSetTemp" title="Enregistrer la consigne chambre" aria-label="Enregistrer la consigne chambre"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
+              <span class="name">BME °C</span>
+              <input id="temp" type="number" min="0" max="110" step="0.5" value="22" title="Consigne de la température BME" />
+              <button type="button" class="btn-gold btn-icon" id="btnSetTemp" title="Enregistrer la consigne BME" aria-label="Enregistrer la consigne BME"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
             </div>
             <div class="set-row">
               <span class="name">Forcer plateau °C</span>
@@ -1525,8 +1537,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <button type="button" class="btn-ghost" id="btnStopKeep">Pause</button>
                 <button type="button" class="btn-danger" id="btnOff">Éteindre</button>
               </div>
-              <p class="hint">Démarrer asservit le plateau à la chambre (plafond 60 °C), lance le cycle d'air et l'éclairage soleil. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
-              <button type="button" class="btn-ghost" id="btnHeatAuto" hidden>Reprendre la chambre</button>
+              <p class="hint">Démarrer asservit le plateau à la température du BME (plafond 60 °C), lance le cycle d'air et l'éclairage soleil. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
+              <button type="button" class="btn-ghost" id="btnHeatAuto" hidden>Reprendre le BME</button>
             </div>
           </div>
 
@@ -1556,7 +1568,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </div>
           <div class="chart-legend">
             <span><i class="swatch" style="background:#3ddc97"></i>Plateau</span>
-            <span><i class="swatch" style="background:#e6b35a"></i>Consigne</span>
+            <span><i class="swatch" style="background:#e6b35a"></i>Consigne BME</span>
             <span><i class="swatch" style="background:#6ec8ff"></i>Température culture</span>
             <span><i class="swatch" style="background:#ff8f6b"></i>Chambre</span>
             <span><i class="swatch" style="background:#c9a0ff"></i>Humidité culture</span>
@@ -1696,7 +1708,7 @@ function applyStatus(s) {
   $("dot").className = "dot " + (s.connected ? "ok" : "bad");
   $("connLabel").textContent = s.connected
     ? (s.incubator_running
-        ? (s.heat_forced ? "Incubateur · plateau forcé" : "Incubateur · chambre")
+        ? (s.heat_forced ? "Incubateur · plateau forcé" : "Incubateur · BME")
         : (s.heat_forced || s.heater_on ? "Chauffe forcée" : "Imprimante OK"))
     : "Imprimante absente";
   $("dotLink").className = "dot " + (linkOnline ? "ok" : "bad");
@@ -1742,7 +1754,7 @@ function applyStatus(s) {
   else showErr("");
 
   $("runState").textContent = s.incubator_running
-    ? `ON · ${s.heat_forced ? "plateau forcé" : "chambre"} · photo / ${s.photo_interval_s} s · prochaine ${fmtRemain(s.photo_next_s)}`
+    ? `ON · ${s.heat_forced ? "plateau forcé" : "BME"} · photo / ${s.photo_interval_s} s · prochaine ${fmtRemain(s.photo_next_s)}`
     : (s.heat_forced || s.heater_on ? "Chauffe forcée" : "Veille");
   $("btnHeatAuto").hidden = !s.heat_forced;
 
@@ -1789,7 +1801,7 @@ let chartPoints = [];
 let chartHover = -1;
 const SERIES = [
   { key: "bed_actual_c", color: "#3ddc97", axis: "temp", label: "Plateau", digits: 2, unit: "°C" },
-  { key: "consigne_c", color: "#e6b35a", axis: "temp", label: "Consigne", digits: 2, unit: "°C" },
+  { key: "consigne_c", color: "#e6b35a", axis: "temp", label: "Consigne BME", digits: 2, unit: "°C" },
   { key: "air_c", color: "#6ec8ff", axis: "temp", label: "Température culture", digits: 2, unit: "°C" },
   { key: "chamber_c", color: "#ff8f6b", axis: "temp", label: "Chambre", digits: 2, unit: "°C" },
   { key: "humidity_pct", color: "#c9a0ff", axis: "hum", label: "Humidité culture", digits: 1, unit: "%" },
@@ -2441,7 +2453,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, CTRL.release_heat_force())
                 if body.get("force"):
                     return self._json(200, CTRL.force_bed(body.get("temp", CTRL.forced_bed_temp)))
-                return self._json(200, CTRL.set_chamber_target(body.get("temp", CTRL.target_temp)))
+                return self._json(200, CTRL.set_air_target(body.get("temp", CTRL.target_temp)))
             if path == "/api/heater/off":
                 return self._json(200, CTRL.heater_off())
             if path == "/api/incubator/start":
