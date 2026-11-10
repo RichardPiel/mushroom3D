@@ -21,6 +21,7 @@ import math
 import mimetypes
 import os
 import secrets
+import shutil
 import threading
 import time
 import urllib.error
@@ -40,7 +41,9 @@ UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8765"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).resolve().parent))
 CONFIG_PATH = DATA_DIR / "config.json"
+STATE_PATH = DATA_DIR / "state.json"
 OUTPUT_DIR = DATA_DIR / "timelapse_champignons"
+LEGACY_DATA_DIR = Path(os.environ.get("LEGACY_DATA_DIR", "/legacy-data"))
 METRICS_CSV = OUTPUT_DIR / "metrics.csv"
 IMAGE_PREFIX = "champignon"
 IMAGE_EXT = ".jpg"
@@ -125,12 +128,55 @@ def _load_config() -> dict[str, Any]:
         return {}
 
 
+def _atomic_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(path)
+
+
 def _save_config(patch: dict[str, Any]) -> dict[str, Any]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     data = _load_config()
     data.update(patch)
-    CONFIG_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    _atomic_json(CONFIG_PATH, data)
     return data
+
+
+def _load_state() -> dict[str, Any]:
+    if not STATE_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        log.warning("state.json illisible — configuration seule")
+        return {}
+
+
+def _import_legacy_data() -> None:
+    """Reprend un ancien volume Docker si le dossier persistant est encore vide."""
+    if not LEGACY_DATA_DIR.is_dir():
+        return
+    try:
+        if DATA_DIR.exists() and any(DATA_DIR.iterdir()):
+            return
+        names = list(LEGACY_DATA_DIR.iterdir())
+    except OSError:
+        return
+    if not names:
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for src in names:
+        dest = DATA_DIR / src.name
+        if src.is_dir():
+            shutil.copytree(src, dest, dirs_exist_ok=True)
+        elif src.is_file():
+            shutil.copy2(src, dest)
+    log.info("Données reprises depuis %s", LEGACY_DATA_DIR)
 
 
 def load_camera_url() -> str:
@@ -381,9 +427,12 @@ class IncubatorController:
         self._heat_tick_at = 0.0
         self._bed_command: float | None = None
         self._air_hist: deque[tuple[float, float]] = deque()
+        self._air_wall: deque[tuple[float, float]] = deque()
         self._air_rate = 0.0
         self._air_sane = True
         self._cool_vent = False
+        self._last_photo_wall: float | None = None
+        self._state_restored = False
         self.photo_interval_s = _cfg_int(cfg, "photo_interval_s", DEFAULT_PHOTO_INTERVAL_S)
         if not (10 <= self.photo_interval_s <= 86400):
             self.photo_interval_s = int(DEFAULT_PHOTO_INTERVAL_S)
@@ -431,16 +480,231 @@ class IncubatorController:
         self.link_seen_at = 0.0
         self.commands: deque[dict[str, Any]] = deque()
         self._stop = threading.Event()
+        self._restore_state()
 
     def start(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         self._ensure_metrics_csv()
-        self._refresh_photo_count()
+        self._remember_photos()
+        self._reassert_outputs()
         threading.Thread(target=self._scheduler, name="incubator-scheduler", daemon=True).start()
 
     def shutdown(self) -> None:
         self._stop.set()
         self._cmd_event.set()
+
+    def _stamp_photo_timer(self, age_s: float) -> None:
+        """Caller holds self.lock. age_s = temps déjà écoulé depuis la dernière photo."""
+        age_s = max(0.0, float(age_s))
+        self._last_photo_wall = time.time() - age_s
+        self._last_auto_photo = time.monotonic() - age_s
+
+    def _capture_state(self) -> dict[str, Any]:
+        """Caller holds self.lock."""
+        return {
+            "incubator_running": self.incubator_running,
+            "started_at": self.started_at,
+            "heater_on": self.heater_on,
+            "bed_command": self._bed_command,
+            "heat_i": self._heat_i,
+            "heat_forced": self.heat_forced,
+            "forced_bed_temp": self.forced_bed_temp,
+            "target_temp": self.target_temp,
+            "cool_vent": self._cool_vent,
+            "vent_mode": self.vent_mode,
+            "vent_on": self.vent_on,
+            "vent_speed": self.vent_speed,
+            "vent_interval_s": self.vent_interval_s,
+            "vent_duration_s": self.vent_duration_s,
+            "vent_actual": self.vent_actual,
+            "vent_remaining_s": self.vent_remaining_s,
+            "light_mode": self.light_mode,
+            "light_on": self.light_on,
+            "light_target": self.light_target,
+            "photo_interval_s": self.photo_interval_s,
+            "last_photo_wall": self._last_photo_wall,
+            "last_photo": self.last_photo,
+            "culture_temp_min": self.culture_temp_min,
+            "culture_temp_max": self.culture_temp_max,
+            "culture_hum_min": self.culture_hum_min,
+            "culture_hum_max": self.culture_hum_max,
+            "camera_url": self.camera_url,
+            "sun_lat": self.sun_lat,
+            "sun_lon": self.sun_lon,
+            "last_error": self.last_error,
+            "bed_actual": self.bed_actual,
+            "bed_target": self.bed_target,
+            "nozzle_actual": self.nozzle_actual,
+            "chamber_c": self.chamber_c,
+            "chamber_target_c": self.chamber_target_c,
+            "printer_ip": self.printer_ip,
+            "machine_name": self.machine_name,
+            "firmware": self.firmware,
+            "bme680": dict(self.bme680),
+            "air_wall": [[wall, temp] for wall, temp in self._air_wall],
+        }
+
+    def _persist_runtime(self) -> None:
+        """Caller holds self.lock."""
+        try:
+            _atomic_json(STATE_PATH, self._capture_state())
+        except OSError:
+            log.exception("Écriture de l'état impossible")
+
+    def _restore_state(self) -> None:
+        state = _load_state()
+        if not state:
+            return
+        self._state_restored = True
+        if "incubator_running" in state:
+            self.incubator_running = bool(state["incubator_running"])
+        if "heater_on" in state:
+            self.heater_on = bool(state["heater_on"])
+        if "heat_forced" in state:
+            self.heat_forced = bool(state["heat_forced"])
+        if "cool_vent" in state:
+            self._cool_vent = bool(state["cool_vent"])
+        if "vent_on" in state:
+            self.vent_on = bool(state["vent_on"])
+        if "light_on" in state:
+            self.light_on = bool(state["light_on"])
+        if "light_target" in state:
+            self.light_target = bool(state["light_target"])
+        if state.get("light_mode") in ("manual", "sun"):
+            self.light_mode = state["light_mode"]
+        if state.get("vent_mode") in ("off", "manual", "cycle"):
+            self.vent_mode = state["vent_mode"]
+            self._vent_saved = True
+        for key, attr in (
+            ("target_temp", "target_temp"),
+            ("forced_bed_temp", "forced_bed_temp"),
+            ("vent_speed", "vent_speed"),
+            ("vent_interval_s", "vent_interval_s"),
+            ("vent_duration_s", "vent_duration_s"),
+            ("photo_interval_s", "photo_interval_s"),
+            ("culture_temp_min", "culture_temp_min"),
+            ("culture_temp_max", "culture_temp_max"),
+            ("culture_hum_min", "culture_hum_min"),
+            ("culture_hum_max", "culture_hum_max"),
+            ("sun_lat", "sun_lat"),
+            ("sun_lon", "sun_lon"),
+            ("heat_i", "_heat_i"),
+        ):
+            if state.get(key) is None:
+                continue
+            try:
+                setattr(self, attr, float(state[key]) if key in ("heat_i", "target_temp", "forced_bed_temp", "culture_temp_min", "culture_temp_max", "culture_hum_min", "culture_hum_max", "sun_lat", "sun_lon") else int(state[key]) if key in ("vent_speed", "vent_interval_s", "vent_duration_s", "photo_interval_s") else float(state[key]))
+            except (TypeError, ValueError):
+                continue
+        if "bed_command" in state and state["bed_command"] is not None:
+            try:
+                self._bed_command = float(state["bed_command"])
+            except (TypeError, ValueError):
+                pass
+        for key, attr in (
+            ("started_at", "started_at"),
+            ("vent_actual", "vent_actual"),
+            ("bed_actual", "bed_actual"),
+            ("bed_target", "bed_target"),
+            ("nozzle_actual", "nozzle_actual"),
+            ("chamber_c", "chamber_c"),
+            ("chamber_target_c", "chamber_target_c"),
+        ):
+            if key not in state:
+                continue
+            if state[key] is None:
+                setattr(self, attr, None)
+                continue
+            try:
+                setattr(self, attr, float(state[key]))
+            except (TypeError, ValueError):
+                pass
+        if state.get("vent_remaining_s") is not None:
+            try:
+                self.vent_remaining_s = int(state["vent_remaining_s"])
+            except (TypeError, ValueError):
+                pass
+        if isinstance(state.get("camera_url"), str) and state["camera_url"].strip():
+            self.camera_url = state["camera_url"]
+        if isinstance(state.get("last_error"), str):
+            self.last_error = state["last_error"]
+        if isinstance(state.get("last_photo"), str):
+            self.last_photo = state["last_photo"]
+        if isinstance(state.get("printer_ip"), str):
+            self.printer_ip = state["printer_ip"]
+        if isinstance(state.get("machine_name"), str) and state["machine_name"]:
+            self.machine_name = state["machine_name"]
+        if isinstance(state.get("firmware"), str) and state["firmware"]:
+            self.firmware = state["firmware"]
+        if isinstance(state.get("bme680"), dict):
+            self.bme680.update(state["bme680"])
+        if state.get("last_photo_wall") is not None:
+            try:
+                age = max(0.0, time.time() - float(state["last_photo_wall"]))
+            except (TypeError, ValueError):
+                age = 0.0
+            self._stamp_photo_timer(age)
+        if "target_temp" in state:
+            self._target_saved = True
+        now_w = time.time()
+        now_m = time.monotonic()
+        for item in state.get("air_wall") or []:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            try:
+                wall = float(item[0])
+                temp = float(item[1])
+            except (TypeError, ValueError):
+                continue
+            age = now_w - wall
+            if age < 0 or age > AIR_LOOKAHEAD_S:
+                continue
+            self._air_wall.append((wall, temp))
+            self._air_hist.append((now_m - age, temp))
+        self._recompute_air_rate()
+        log.info(
+            "État restauré — incubateur %s, plateau %s °C, %s photo(s)",
+            "allumé" if self.incubator_running else "éteint",
+            "—" if self._bed_command is None else f"{self._bed_command:.1f}",
+            self.photo_count,
+        )
+
+    def _remember_photos(self) -> None:
+        """Caller may run without the lock during start()."""
+        files = list(OUTPUT_DIR.glob(f"{IMAGE_PREFIX}_*{IMAGE_EXT}"))
+        with self.lock:
+            self.photo_count = len(files)
+            if not files:
+                return
+            newest = max(files, key=lambda path: path.stat().st_mtime)
+            self.last_photo = newest.name
+            mtime = newest.stat().st_mtime
+            if self._last_photo_wall is None or mtime > self._last_photo_wall + 1:
+                self._stamp_photo_timer(max(0.0, time.time() - mtime))
+
+    def _reassert_outputs(self) -> None:
+        """Renvoie à la carte l'état enregistré. Le premier démarrage ne touche à rien."""
+        with self.lock:
+            if not self._state_restored:
+                return
+            if self.incubator_running:
+                bed = 0.0 if self._bed_command is None else float(self._bed_command)
+                self._queue_bed(bed, start=True)
+                self._queue_vent("manual" if self._cool_vent else self.vent_mode)
+                self.light_known = False
+                if self.light_mode == "sun":
+                    on, elevation = sun_is_up(self.sun_lat, self.sun_lon)
+                    self.sun_elevation = elevation
+                    self._ensure_light(on, force=True)
+                elif self.light_target:
+                    self._ensure_light(True, force=True)
+                log.info("Sorties reprises (incubateur allumé, plateau %.1f °C)", bed)
+                return
+            if self.heater_on or (self._bed_command or 0) > 0:
+                bed = 0.0 if self._bed_command is None else float(self._bed_command)
+                self._queue_bed(bed, start=False)
+            self._queue_vent(self.vent_mode if self.vent_mode in ("off", "manual", "cycle") else "off")
+            log.info("Sorties reprises (incubateur éteint)")
 
     def _ensure_metrics_csv(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -509,6 +773,7 @@ class IncubatorController:
 
     def status(self) -> dict[str, Any]:
         with self.lock:
+            self._persist_runtime()
             now = time.time()
             age = (now - self.link_seen_at) if self.link_seen_at else None
             online = age is not None and age < LINK_STALE_S
@@ -730,6 +995,7 @@ class IncubatorController:
             if bme.get("ok") and bme.get("temperature_c") is not None:
                 self._control_bed()
             self._append_metrics()
+            self._persist_runtime()
             return {"ok": True}
 
     def pop_commands(self, wait_s: float = COMMAND_LONG_POLL_S) -> list[dict[str, Any]]:
@@ -795,25 +1061,35 @@ class IncubatorController:
     def _reset_air_trend(self) -> None:
         """Caller holds self.lock."""
         self._air_hist.clear()
+        self._air_wall.clear()
         self._air_rate = 0.0
 
-    def _note_air(self, air: float) -> None:
-        """Caller holds self.lock. Pente du BME sur la fenêtre récente."""
-        now = time.monotonic()
-        self._air_hist.append((now, air))
-        cutoff = now - AIR_LOOKAHEAD_S
-        while self._air_hist and self._air_hist[0][0] < cutoff:
-            self._air_hist.popleft()
+    def _recompute_air_rate(self) -> None:
+        """Caller holds self.lock."""
         if len(self._air_hist) < 2:
             self._air_rate = 0.0
             return
         started, first = self._air_hist[0]
-        span = now - started
+        newest, last = self._air_hist[-1]
+        span = newest - started
         if span < AIR_RATE_MIN_SPAN_S:
             self._air_rate = 0.0
             return
-        rate = (air - first) / span
+        rate = (last - first) / span
         self._air_rate = max(-AIR_RATE_MAX, min(AIR_RATE_MAX, rate))
+
+    def _note_air(self, air: float) -> None:
+        """Caller holds self.lock. Pente du BME sur la fenêtre récente."""
+        now = time.monotonic()
+        wall = time.time()
+        self._air_hist.append((now, air))
+        self._air_wall.append((wall, air))
+        cutoff = now - AIR_LOOKAHEAD_S
+        while self._air_hist and self._air_hist[0][0] < cutoff:
+            self._air_hist.popleft()
+        while self._air_wall and self._air_wall[0][0] < wall - AIR_LOOKAHEAD_S:
+            self._air_wall.popleft()
+        self._recompute_air_rate()
 
     def _band_edge(self, air: float) -> float | None:
         """Bord déjà franchi, ou None si le BME est dans la plage."""
@@ -1115,7 +1391,7 @@ class IncubatorController:
             self._target_saved = True
             self._persist_setpoints()
             _save_config({"light_mode": "sun"})
-            self._last_auto_photo = time.monotonic() - self.photo_interval_s
+            self._stamp_photo_timer(self.photo_interval_s)
             self._queue_bed(bed, start=True)
             self._enqueue(
                 {
@@ -1280,12 +1556,12 @@ class IncubatorController:
                 return
             if time.monotonic() - self._last_auto_photo < self.photo_interval_s:
                 return
-            self._last_auto_photo = time.monotonic()
+            self._stamp_photo_timer(0)
         result = self.take_snapshot()
         if not result.get("ok"):
             with self.lock:
                 retry = min(30, self.photo_interval_s)
-                self._last_auto_photo = time.monotonic() - self.photo_interval_s + retry
+                self._stamp_photo_timer(self.photo_interval_s - retry)
 
     def camera_enable(self) -> dict[str, Any]:
         # Activation locale côté carte via SDCP ; le preview passe par camera_url.
@@ -1312,6 +1588,7 @@ class IncubatorController:
             self.last_photo = name
             self._refresh_photo_count()
             self._append_metrics(photo=name)
+            self._persist_runtime()
         return {"ok": True, "file": name, "url": f"/photos/{name}"}
 
     def grab_jpeg_bytes(self) -> bytes | None:
@@ -1360,6 +1637,8 @@ class IncubatorController:
                 continue
         return best + 1
 
+
+_import_legacy_data()
 
 CTRL = IncubatorController()
 
