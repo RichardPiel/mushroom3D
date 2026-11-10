@@ -78,6 +78,10 @@ LINK_STALE_S = 30
 COMMAND_LONG_POLL_S = 25
 DEFAULT_CAMERA_URL = "http://192.168.1.20:3031/video"
 DEFAULT_TARGET_TEMP = 22.0
+DEFAULT_CULTURE_TEMP_MIN = 18.0
+DEFAULT_CULTURE_TEMP_MAX = 26.0
+DEFAULT_CULTURE_HUM_MIN = 70.0
+DEFAULT_CULTURE_HUM_MAX = 95.0
 DEFAULT_PHOTO_INTERVAL_S = 1800
 DEFAULT_VENT_SPEED = 60
 DEFAULT_VENT_INTERVAL_S = 1800
@@ -325,7 +329,9 @@ class IncubatorController:
         self.last_error = ""
 
         cfg = _load_config()
-        self.target_temp = float(DEFAULT_TARGET_TEMP)
+        self._target_saved = "target_temp" in cfg
+        self._vent_saved = "vent_speed" in cfg
+        self.target_temp = _cfg_float(cfg, "target_temp", DEFAULT_TARGET_TEMP)
         self.photo_interval_s = _cfg_int(cfg, "photo_interval_s", DEFAULT_PHOTO_INTERVAL_S)
         if not (10 <= self.photo_interval_s <= 86400):
             self.photo_interval_s = int(DEFAULT_PHOTO_INTERVAL_S)
@@ -341,11 +347,16 @@ class IncubatorController:
         self._last_auto_photo = time.monotonic()
         self._last_light_cmd = 0.0
 
-        self.vent_mode = "off"
+        saved_mode = cfg.get("vent_mode")
+        self.vent_mode = saved_mode if saved_mode in ("off", "manual", "cycle") else "off"
         self.vent_on = False
-        self.vent_speed = int(DEFAULT_VENT_SPEED)
-        self.vent_interval_s = int(DEFAULT_VENT_INTERVAL_S)
-        self.vent_duration_s = int(DEFAULT_VENT_ON_S)
+        self.vent_speed = _cfg_int(cfg, "vent_speed", DEFAULT_VENT_SPEED)
+        self.vent_interval_s = _cfg_int(cfg, "vent_interval_s", DEFAULT_VENT_INTERVAL_S)
+        self.vent_duration_s = _cfg_int(cfg, "vent_duration_s", DEFAULT_VENT_ON_S)
+        self.culture_temp_min = _cfg_float(cfg, "culture_temp_min", DEFAULT_CULTURE_TEMP_MIN)
+        self.culture_temp_max = _cfg_float(cfg, "culture_temp_max", DEFAULT_CULTURE_TEMP_MAX)
+        self.culture_hum_min = _cfg_float(cfg, "culture_hum_min", DEFAULT_CULTURE_HUM_MIN)
+        self.culture_hum_max = _cfg_float(cfg, "culture_hum_max", DEFAULT_CULTURE_HUM_MAX)
         self.vent_actual: float | None = None
         self.vent_remaining_s: int | None = None
 
@@ -456,6 +467,10 @@ class IncubatorController:
                 "firmware": self.firmware,
                 "last_error": self.last_error,
                 "target_temp": self.target_temp,
+                "culture_temp_min": self.culture_temp_min,
+                "culture_temp_max": self.culture_temp_max,
+                "culture_hum_min": self.culture_hum_min,
+                "culture_hum_max": self.culture_hum_max,
                 "photo_interval_s": self.photo_interval_s,
                 "photo_next_s": self._photo_next_s(),
                 "heater_on": self.heater_on,
@@ -492,6 +507,73 @@ class IncubatorController:
                     "pending_commands": len(self.commands),
                 },
             }
+
+    def _persist_setpoints(self) -> None:
+        """Caller holds self.lock."""
+        _save_config(
+            {
+                "target_temp": self.target_temp,
+                "vent_mode": self.vent_mode,
+                "vent_speed": self.vent_speed,
+                "vent_interval_s": self.vent_interval_s,
+                "vent_duration_s": self.vent_duration_s,
+            }
+        )
+
+    def update_settings(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            patch: dict[str, Any] = {}
+            range_keys = (
+                "culture_temp_min",
+                "culture_temp_max",
+                "culture_hum_min",
+                "culture_hum_max",
+            )
+            if any(key in body for key in range_keys):
+                try:
+                    tmin = float(body.get("culture_temp_min", self.culture_temp_min))
+                    tmax = float(body.get("culture_temp_max", self.culture_temp_max))
+                    hmin = float(body.get("culture_hum_min", self.culture_hum_min))
+                    hmax = float(body.get("culture_hum_max", self.culture_hum_max))
+                except (TypeError, ValueError):
+                    self.last_error = "Plage culture invalide"
+                    return self.status()
+                if not (0 <= tmin <= tmax <= 110):
+                    self.last_error = "Plage température : 0–110 °C, min ≤ max"
+                    return self.status()
+                if not (0 <= hmin <= hmax <= 100):
+                    self.last_error = "Plage humidité : 0–100 %, min ≤ max"
+                    return self.status()
+                self.culture_temp_min = tmin
+                self.culture_temp_max = tmax
+                self.culture_hum_min = hmin
+                self.culture_hum_max = hmax
+                patch.update(
+                    {
+                        "culture_temp_min": tmin,
+                        "culture_temp_max": tmax,
+                        "culture_hum_min": hmin,
+                        "culture_hum_max": hmax,
+                    }
+                )
+            cam = body.get("camera_url")
+            if isinstance(cam, str) and cam.strip():
+                url = parse_camera_url(cam)
+                self.camera_url = url
+                patch["camera_url"] = url
+                self._enqueue({"type": "camera_url", "url": url})
+            if patch:
+                _save_config(patch)
+            if "sun_lat" in body or "sun_lon" in body:
+                error = self._assign_sun_place(
+                    self.sun_lat if "sun_lat" not in body else body.get("sun_lat"),
+                    self.sun_lon if "sun_lon" not in body else body.get("sun_lon"),
+                )
+                if error:
+                    self.last_error = error
+                    return self.status()
+            self.last_error = ""
+            return self.status()
 
     def set_camera_url(self, raw: str) -> dict[str, Any]:
         url = parse_camera_url(raw)
@@ -549,20 +631,37 @@ class IncubatorController:
 
             if "heater_on" in desired:
                 self.heater_on = bool(desired["heater_on"])
-            if desired.get("target_temp") is not None:
-                self.target_temp = float(desired["target_temp"])
-            if desired.get("vent_mode") in ("off", "manual", "cycle"):
-                self.vent_mode = str(desired["vent_mode"])
             if "vent_on" in desired:
                 self.vent_on = bool(desired["vent_on"])
-            if desired.get("vent_speed") is not None:
-                self.vent_speed = int(desired["vent_speed"])
-            if desired.get("vent_interval_s") is not None:
-                self.vent_interval_s = int(desired["vent_interval_s"])
-            if desired.get("vent_duration_s") is not None:
-                self.vent_duration_s = int(desired["vent_duration_s"])
             if desired.get("vent_remaining_s") is not None:
                 self.vent_remaining_s = int(desired["vent_remaining_s"])
+            # La carte remet target_temp à 0 dès que le plateau s'éteint.
+            # Les consignes vivent dans config.json ; on n'adopte la télémétrie qu'une fois,
+            # tant qu'aucune valeur n'a encore été enregistrée.
+            if not self._target_saved and desired.get("heater_on"):
+                try:
+                    adopted = float(desired.get("target_temp"))
+                except (TypeError, ValueError):
+                    adopted = 0.0
+                if adopted > 0:
+                    self.target_temp = adopted
+                    self._target_saved = True
+                    _save_config({"target_temp": adopted})
+            if not self._vent_saved and desired.get("vent_speed") is not None:
+                mode = desired.get("vent_mode")
+                if mode not in ("off", "manual", "cycle"):
+                    mode = self.vent_mode
+                try:
+                    self.vent_speed = int(desired["vent_speed"])
+                    if desired.get("vent_interval_s") is not None:
+                        self.vent_interval_s = int(desired["vent_interval_s"])
+                    if desired.get("vent_duration_s") is not None:
+                        self.vent_duration_s = int(desired["vent_duration_s"])
+                    self.vent_mode = str(mode)
+                    self._vent_saved = True
+                    self._persist_setpoints()
+                except (TypeError, ValueError):
+                    pass
 
             self._append_metrics()
             return {"ok": True}
@@ -602,7 +701,9 @@ class IncubatorController:
                 self.last_error = "Température hors plage 0–110 °C"
                 return self.status()
             self.target_temp = temp_c
+            self._target_saved = True
             self.heater_on = keep_on and temp_c > 0
+            self._persist_setpoints()
             self._enqueue({"type": "heater_set", "temp": temp_c})
             self.last_error = ""
             return self.status()
@@ -612,7 +713,12 @@ class IncubatorController:
             self.incubator_running = False
             self.heater_on = False
             self.vent_mode = "off"
+            self._vent_saved = True
             self.vent_on = False
+            self.light_mode = "manual"
+            self._persist_setpoints()
+            _save_config({"light_mode": "manual"})
+            self._ensure_light(False, force=True)
             self._enqueue({"type": "heater_off"})
             self._enqueue(
                 {
@@ -652,7 +758,9 @@ class IncubatorController:
             self.vent_interval_s = new_interval
             self.vent_duration_s = new_duration
             self.vent_mode = mode
+            self._vent_saved = True
             self.vent_on = mode in ("manual", "cycle")
+            self._persist_setpoints()
             self._enqueue(
                 {
                     "type": "vent",
@@ -696,11 +804,36 @@ class IncubatorController:
                 if error:
                     self.last_error = error
                     return self.status()
+            if not (0 < self.vent_speed <= 100):
+                self.last_error = "Vitesse d'air hors plage 1–100 %"
+                return self.status()
+            if self.vent_duration_s >= self.vent_interval_s:
+                self.last_error = "L'air doit rester allumé moins longtemps qu'il ne se relance"
+                return self.status()
             self.heater_on = True
             self.incubator_running = True
+            self.vent_mode = "cycle"
+            self.vent_on = True
+            self._vent_saved = True
+            self.light_mode = "sun"
             self.started_at = time.time()
+            self._target_saved = True
+            self._persist_setpoints()
+            _save_config({"light_mode": "sun"})
             self._last_auto_photo = time.monotonic() - self.photo_interval_s
             self._enqueue({"type": "incubator_start", "temp": self.target_temp})
+            self._enqueue(
+                {
+                    "type": "vent",
+                    "mode": "cycle",
+                    "speed": self.vent_speed,
+                    "interval_s": self.vent_interval_s,
+                    "duration_s": self.vent_duration_s,
+                }
+            )
+            up, elevation = sun_is_up(self.sun_lat, self.sun_lon)
+            self.sun_elevation = elevation
+            self._ensure_light(up, force=True)
             self.last_error = ""
             return self.status()
 
@@ -709,7 +842,24 @@ class IncubatorController:
             self.incubator_running = False
             if turn_off_heat:
                 self.heater_on = False
+            self.vent_mode = "off"
+            self.vent_on = False
+            self._vent_saved = True
+            self.light_mode = "manual"
+            self._persist_setpoints()
+            _save_config({"light_mode": "manual"})
             self._enqueue({"type": "incubator_stop", "turn_off_heat": bool(turn_off_heat)})
+            self._enqueue(
+                {
+                    "type": "vent",
+                    "mode": "off",
+                    "speed": self.vent_speed,
+                    "interval_s": self.vent_interval_s,
+                    "duration_s": self.vent_duration_s,
+                }
+            )
+            if turn_off_heat:
+                self._ensure_light(False, force=True)
             return self.status()
 
     def _photo_next_s(self) -> int | None:
@@ -927,7 +1077,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   :root {
     --bg: #070a0d;
     --panel: #10151a;
-    --panel-2: #141b22;
     --line: rgba(255,255,255,.08);
     --text: #eef3f0;
     --muted: #8b9691;
@@ -981,6 +1130,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     margin-top: 4px; font-size: 1.45rem; font-weight: 650; letter-spacing: -.03em;
   }
   .kpi-card .value small { font-size: .75rem; color: var(--muted); font-weight: 460; }
+  .kpi-card .band { margin-top: 2px; color: var(--muted); font-size: .72rem; }
+  .kpi-card.in { border-color: rgba(61,220,151,.65); }
+  .kpi-card.in .value { color: var(--ok); }
+  .kpi-card.out { border-color: rgba(230,179,90,.75); }
+  .kpi-card.out .value { color: var(--warn); }
 
   .dash {
     display: grid; grid-template-columns: 1.2fr 1fr; gap: 14px; align-items: start;
@@ -1003,28 +1157,52 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   .cam-frame { position: relative; background: #050709; aspect-ratio: 16/10; }
   .cam-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .cam-actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+  .cam-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .cam-actions button {
+    width: 42px; height: 42px; padding: 0; display: grid; place-items: center;
+  }
+  .cam-actions svg { display: block; }
 
-  .set-list { display: grid; gap: 10px; }
-  .set-row, .mode-block {
-    display: grid; gap: 8px; padding: 12px; border-radius: 14px;
-    background: var(--panel-2); border: 1px solid var(--line);
+  .set-list { display: grid; gap: 8px; }
+  .set-row {
+    display: grid; grid-template-columns: minmax(0, 1fr) 96px 36px; align-items: center;
+    gap: 8px;
   }
-  .set-row .head, .mode-block .head {
-    display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
-  }
-  .set-row .name, .mode-block .name { font-weight: 560; font-size: .92rem; }
-  .set-row .unit, .mode-block .state { color: var(--muted); font-size: .78rem; }
-  .mode-block .state { text-align: right; }
-  .set-ctrl { display: grid; gap: 8px; }
-  .set-ctrl input {
-    width: 100%; padding: 11px 12px; border-radius: 12px;
+  .set-row .name { font-weight: 560; font-size: .84rem; }
+  .set-row input {
+    width: 100%; padding: 7px 8px; border-radius: 10px;
     border: 1px solid var(--line); background: #0b1015; color: var(--text); font: inherit;
   }
-  .set-ctrl input:focus { outline: 2px solid rgba(61,220,151,.4); border-color: transparent; }
-  .trio, .trio-modes { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 8px; }
-  .trio-modes { grid-template-columns: 1fr 1fr 1fr; }
-  .modes { display: grid; gap: 10px; margin-top: 12px; }
+  .set-row input:focus { outline: 2px solid rgba(61,220,151,.4); border-color: transparent; }
+  .btn-icon {
+    width: 36px; height: 36px; padding: 0; display: grid; place-items: center;
+  }
+  .btn-icon svg { display: block; }
+  .mode-block {
+    display: grid; gap: 8px; padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+  .mode-block .head {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  }
+  .mode-block .name { font-weight: 560; font-size: .92rem; }
+  .mode-block .state { color: var(--muted); font-size: .78rem; text-align: right; }
+  .trio-modes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  dialog {
+    width: min(480px, calc(100% - 24px)); padding: 0; border: 1px solid var(--line);
+    border-radius: 16px; background: var(--panel); color: var(--text);
+  }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  dialog form { padding: 16px; display: grid; gap: 12px; }
+  dialog h2 { margin: 0; font-size: 1.05rem; }
+  .dlg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  dialog label { display: block; font-size: .75rem; color: var(--muted); margin-bottom: 4px; }
+  dialog input {
+    width: 100%; padding: 9px 10px; border-radius: 10px;
+    border: 1px solid var(--line); background: #0b1015; color: var(--text); font: inherit;
+  }
+  .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .modes { display: grid; gap: 12px; margin-top: 14px; }
 
   button {
     font: inherit; font-weight: 560; border: 0; border-radius: 12px;
@@ -1076,6 +1254,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="pills">
         <div class="pill"><span class="dot" id="dotLink"></span><span id="linkLabel">Relais</span></div>
         <div class="pill"><span class="dot" id="dot"></span><span id="connLabel">—</span></div>
+        <button type="button" class="btn-ghost" id="btnSettings">Réglages</button>
         <button type="button" class="btn-ghost" id="btnLogout" hidden>Sortir</button>
       </div>
     </header>
@@ -1084,8 +1263,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="kpi-card"><div class="label">Plateau</div><div class="value" id="bedActual">—<small> °C</small></div></div>
       <div class="kpi-card"><div class="label">Consigne</div><div class="value" id="bedTarget">—<small> °C</small></div></div>
       <div class="kpi-card"><div class="label">Chambre</div><div class="value" id="chamberTemp">—<small> °C</small></div></div>
-      <div class="kpi-card"><div class="label">Air BME</div><div class="value" id="bmeTemp">—<small> °C</small></div></div>
-      <div class="kpi-card"><div class="label">Humidité</div><div class="value" id="bmeHum">—<small> %</small></div></div>
+      <div class="kpi-card" id="kpiCultureTemp">
+        <div class="label">Température culture</div>
+        <div class="value" id="bmeTemp">—<small> °C</small></div>
+        <div class="band" id="cultureTempBand"></div>
+      </div>
+      <div class="kpi-card" id="kpiCultureHum">
+        <div class="label">Humidité culture</div>
+        <div class="value" id="bmeHum">—<small> %</small></div>
+        <div class="band" id="cultureHumBand"></div>
+      </div>
       <div class="kpi-card"><div class="label">Air box</div><div class="value" id="ventActual">—<small> %</small></div></div>
       <div class="kpi-card"><div class="label">Photos</div><div class="value" id="photoCount">0</div></div>
     </section>
@@ -1098,11 +1285,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
         <div class="body">
           <div class="cam-actions">
-            <button type="button" class="btn-gold" id="btnLight">Flash</button>
-            <button type="button" class="btn-ghost" id="btnSnap">Photo</button>
-            <button type="button" class="btn-ghost" id="btnRefresh">Rafraîchir</button>
+            <button type="button" class="btn-gold" id="btnLight" title="Flash" aria-label="Allumer le flash" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg></button>
+            <button type="button" class="btn-gold" id="btnVent" title="Ventilation" aria-label="Allumer la ventilation" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/><path d="M12 10c-1.8-3.2-1.6-6.2.2-8 2.6 2 2.4 5.2-.2 8zM14 12c3.2-1.8 6.2-1.6 8 .2-2 2.6-5.2 2.4-8-.2zM12 14c1.8 3.2 1.6 6.2-.2 8-2.6-2-2.4-5.2.2-8zM10 12c-3.2 1.8-6.2 1.6-8-.2 2-2.6 5.2-2.4 8 .2z"/></svg></button>
+            <button type="button" class="btn-ghost" id="btnSnap" title="Photo" aria-label="Prendre une photo"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M9 4h6l1.2 2H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3.8L9 4zm3 5a5 5 0 1 0 .01 10.01A5 5 0 0 0 12 9zm0 2a3 3 0 1 1 0 6 3 3 0 0 1 0-6z"/></svg></button>
+            <button type="button" class="btn-ghost" id="btnRefresh" title="Rafraîchir" aria-label="Rafraîchir le flux"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A8 8 0 1 0 19.73 14h-2.09a6 6 0 1 1-1.58-5.9L13 11V4h7l-2.35 2.35z"/></svg></button>
           </div>
-          <p class="hint" id="sunState" style="margin-top:10px">—</p>
         </div>
       </section>
 
@@ -1111,99 +1298,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="body">
           <div class="set-list">
             <div class="set-row">
-              <div class="head"><span class="name">Température plateau</span><span class="unit">°C</span></div>
-              <div class="set-ctrl">
-                <input id="temp" type="number" min="0" max="110" step="0.5" value="22" />
-                <div class="trio">
-                  <button type="button" class="btn-ghost btn-step" data-target="temp" data-delta="-0.5">−</button>
-                  <button type="button" class="btn-gold" id="btnSetTemp">Appliquer</button>
-                  <button type="button" class="btn-ghost btn-step" data-target="temp" data-delta="0.5">+</button>
-                </div>
-              </div>
+              <span class="name">Plateau °C</span>
+              <input id="temp" type="number" min="0" max="110" step="0.5" value="22" />
+              <button type="button" class="btn-gold btn-icon" id="btnSetTemp" title="Enregistrer" aria-label="Enregistrer la température"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
             </div>
-
             <div class="set-row">
-              <div class="head"><span class="name">Intervalle photo</span><span class="unit">secondes</span></div>
-              <div class="set-ctrl">
-                <input id="interval" type="number" min="10" max="86400" step="10" value="1800" />
-                <div class="trio">
-                  <button type="button" class="btn-ghost btn-step" data-target="interval" data-delta="-10">−</button>
-                  <button type="button" class="btn-gold" id="btnSetInterval">Appliquer</button>
-                  <button type="button" class="btn-ghost btn-step" data-target="interval" data-delta="10">+</button>
-                </div>
-              </div>
+              <span class="name">Photo / s</span>
+              <input id="interval" type="number" min="10" max="86400" step="10" value="1800" />
+              <button type="button" class="btn-gold btn-icon" id="btnSetInterval" title="Enregistrer" aria-label="Enregistrer l'intervalle photo"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
             </div>
-
             <div class="set-row">
-              <div class="head"><span class="name">Vitesse ventilation</span><span class="unit">%</span></div>
-              <div class="set-ctrl">
-                <input id="ventSpeed" type="number" min="0" max="100" step="5" value="60" />
-                <div class="trio">
-                  <button type="button" class="btn-ghost btn-step" data-target="ventSpeed" data-delta="-5">−</button>
-                  <button type="button" class="btn-gold" id="btnSetVentSpeed">Appliquer</button>
-                  <button type="button" class="btn-ghost btn-step" data-target="ventSpeed" data-delta="5">+</button>
-                </div>
-              </div>
+              <span class="name">Ventilation %</span>
+              <input id="ventSpeed" type="number" min="0" max="100" step="5" value="60" />
+              <button type="button" class="btn-gold btn-icon" id="btnSetVentSpeed" title="Enregistrer" aria-label="Enregistrer la vitesse"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
             </div>
-
             <div class="set-row">
-              <div class="head"><span class="name">Cycle — tous les</span><span class="unit">secondes</span></div>
-              <div class="set-ctrl">
-                <input id="ventInterval" type="number" min="30" step="30" value="1800" />
-                <div class="trio">
-                  <button type="button" class="btn-ghost btn-step" data-target="ventInterval" data-delta="-30">−</button>
-                  <button type="button" class="btn-gold" id="btnSetVentInterval">Appliquer</button>
-                  <button type="button" class="btn-ghost btn-step" data-target="ventInterval" data-delta="30">+</button>
-                </div>
-              </div>
+              <span class="name" title="En mode cycle, l'air se relance toutes les N secondes">Air repris toutes les s</span>
+              <input id="ventInterval" type="number" min="30" step="30" value="1800" title="Secondes entre deux mises en route de l'air" />
+              <button type="button" class="btn-gold btn-icon" id="btnSetVentInterval" title="Enregistrer" aria-label="Enregistrer la reprise de l'air"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
             </div>
-
             <div class="set-row">
-              <div class="head"><span class="name">Cycle — pendant</span><span class="unit">secondes</span></div>
-              <div class="set-ctrl">
-                <input id="ventDuration" type="number" min="5" step="5" value="120" />
-                <div class="trio">
-                  <button type="button" class="btn-ghost btn-step" data-target="ventDuration" data-delta="-5">−</button>
-                  <button type="button" class="btn-gold" id="btnSetVentDuration">Appliquer</button>
-                  <button type="button" class="btn-ghost btn-step" data-target="ventDuration" data-delta="5">+</button>
-                </div>
-              </div>
-            </div>
-
-            <div class="set-row">
-              <div class="head"><span class="name">Latitude soleil</span><span class="unit">°</span></div>
-              <div class="set-ctrl">
-                <input id="sunLat" type="number" min="-90" max="90" step="0.01" value="48.86" />
-                <div class="trio">
-                  <button type="button" class="btn-ghost btn-step" data-target="sunLat" data-delta="-0.1">−</button>
-                  <button type="button" class="btn-gold" id="btnSetSun">Appliquer</button>
-                  <button type="button" class="btn-ghost btn-step" data-target="sunLat" data-delta="0.1">+</button>
-                </div>
-              </div>
-            </div>
-
-            <div class="set-row">
-              <div class="head"><span class="name">Longitude soleil</span><span class="unit">°</span></div>
-              <div class="set-ctrl">
-                <input id="sunLon" type="number" min="-180" max="180" step="0.01" value="2.35" />
-                <div class="trio">
-                  <button type="button" class="btn-ghost btn-step" data-target="sunLon" data-delta="-0.1">−</button>
-                  <button type="button" class="btn-gold" id="btnSetSunLon">Appliquer</button>
-                  <button type="button" class="btn-ghost btn-step" data-target="sunLon" data-delta="0.1">+</button>
-                </div>
-              </div>
-            </div>
-
-            <div class="set-row">
-              <div class="head"><span class="name">URL caméra</span><span class="unit">MJPEG</span></div>
-              <div class="set-ctrl">
-                <input id="cameraUrl" type="url" placeholder="http://192.168.1.20:3031/video" autocomplete="off" spellcheck="false" />
-                <div class="trio">
-                  <button type="button" class="btn-ghost" id="btnCamClear" title="Vider">×</button>
-                  <button type="button" class="btn-gold" id="btnCameraUrl">Appliquer</button>
-                  <button type="button" class="btn-ghost" id="btnCamDefault" title="Défaut">↺</button>
-                </div>
-              </div>
+              <span class="name" title="En mode cycle, l'air reste allumé pendant N secondes">Air allumé pendant s</span>
+              <input id="ventDuration" type="number" min="5" step="5" value="120" title="Secondes pendant lesquelles l'air reste allumé" />
+              <button type="button" class="btn-gold btn-icon" id="btnSetVentDuration" title="Enregistrer" aria-label="Enregistrer la durée d'air allumé"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
             </div>
           </div>
 
@@ -1218,28 +1335,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <button type="button" class="btn-ghost" id="btnStopKeep">Pause</button>
                 <button type="button" class="btn-danger" id="btnOff">Éteindre</button>
               </div>
-            </div>
-            <div class="mode-block">
-              <div class="head">
-                <span class="name">Ventilation</span>
-                <span class="state" id="ventState">Arrêt</span>
-              </div>
-              <div class="trio-modes">
-                <button type="button" class="btn-ghost" id="btnVentManual">Manuel</button>
-                <button type="button" class="btn-ghost" id="btnVentCycle">Cycle</button>
-                <button type="button" class="btn-ghost" id="btnVentOff">Stop</button>
-              </div>
-            </div>
-            <div class="mode-block">
-              <div class="head">
-                <span class="name">Flash</span>
-                <span class="state" id="lightModeState">Manuel</span>
-              </div>
-              <div class="trio-modes" id="lightMode">
-                <button type="button" class="btn-ghost" data-mode="manual" aria-pressed="true">Manuel</button>
-                <button type="button" class="btn-ghost" data-mode="sun">Soleil</button>
-                <button type="button" class="btn-ghost" id="btnLightModeApply">Appliquer lieu</button>
-              </div>
+              <p class="hint">Démarrer lance le chauffage, le cycle d'air et l'éclairage soleil.</p>
             </div>
           </div>
 
@@ -1267,9 +1363,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <div class="chart-legend">
             <span><i class="swatch" style="background:#3ddc97"></i>Plateau</span>
             <span><i class="swatch" style="background:#e6b35a"></i>Consigne</span>
-            <span><i class="swatch" style="background:#6ec8ff"></i>Air BME</span>
+            <span><i class="swatch" style="background:#6ec8ff"></i>Température culture</span>
             <span><i class="swatch" style="background:#ff8f6b"></i>Chambre</span>
-            <span><i class="swatch" style="background:#c9a0ff"></i>Humidité %</span>
+            <span><i class="swatch" style="background:#c9a0ff"></i>Humidité culture</span>
             <span><i class="swatch" style="background:#5ee0c2"></i>Ventilation</span>
             <span><i class="swatch" style="background:#ffd07a"></i>Flash</span>
           </div>
@@ -1287,11 +1383,45 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <footer>Relais ESP32 · Centauri Carbon · BME680</footer>
   </div>
 
+  <dialog id="cfgDialog">
+    <form id="cfgForm">
+      <h2>Configuration</h2>
+      <div>
+        <div class="name" style="font-weight:560;margin-bottom:6px">Plage température culture</div>
+        <div class="dlg-grid">
+          <div><label for="cfgTempMin">Min °C</label><input id="cfgTempMin" type="number" min="0" max="110" step="0.5" /></div>
+          <div><label for="cfgTempMax">Max °C</label><input id="cfgTempMax" type="number" min="0" max="110" step="0.5" /></div>
+        </div>
+      </div>
+      <div>
+        <div class="name" style="font-weight:560;margin-bottom:6px">Plage humidité culture</div>
+        <div class="dlg-grid">
+          <div><label for="cfgHumMin">Min %</label><input id="cfgHumMin" type="number" min="0" max="100" step="1" /></div>
+          <div><label for="cfgHumMax">Max %</label><input id="cfgHumMax" type="number" min="0" max="100" step="1" /></div>
+        </div>
+      </div>
+      <div>
+        <label for="cameraUrl">URL vidéo</label>
+        <input id="cameraUrl" type="url" placeholder="http://192.168.1.20:3031/video" autocomplete="off" spellcheck="false" />
+      </div>
+      <div>
+        <div class="name" style="font-weight:560;margin-bottom:6px">Position géographique</div>
+        <div class="dlg-grid">
+          <div><label for="sunLat">Latitude</label><input id="sunLat" type="number" min="-90" max="90" step="0.0001" /></div>
+          <div><label for="sunLon">Longitude</label><input id="sunLon" type="number" min="-180" max="180" step="0.0001" /></div>
+        </div>
+      </div>
+      <div class="dlg-actions">
+        <button type="button" class="btn-ghost" id="cfgCancel">Annuler</button>
+        <button type="submit" class="btn-gold">Enregistrer</button>
+      </div>
+    </form>
+  </dialog>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const DEFAULT_CAMERA_URL = "http://192.168.1.20:3031/video";
 let ventMode = "off";
-let lightMode = "manual";
 
 async function api(path, opts) {
   const r = await fetch(path, {
@@ -1341,6 +1471,18 @@ function clampInput(id) {
   return v;
 }
 
+function paintBand(id, value, min, max) {
+  const card = $(id);
+  const v = Number(value);
+  const lo = Number(min);
+  const hi = Number(max);
+  if (!Number.isFinite(v) || !Number.isFinite(lo) || !Number.isFinite(hi)) {
+    card.className = "kpi-card";
+    return;
+  }
+  card.className = "kpi-card " + (v >= lo && v <= hi ? "in" : "out");
+}
+
 function showErr(msg) {
   const err = $("err");
   if (!msg) { err.classList.remove("show"); err.textContent = ""; return; }
@@ -1355,7 +1497,6 @@ function sunPlace() {
 function applyStatus(s) {
   const linkOnline = !!(s.link && s.link.online);
   ventMode = s.vent_mode || "off";
-  lightMode = s.light_mode || "manual";
 
   $("identity").textContent = `${s.machine_name} · FW ${s.firmware} · ${s.printer_ip || "—"}`;
   $("dot").className = "dot " + (s.connected ? "ok" : "bad");
@@ -1376,6 +1517,10 @@ function applyStatus(s) {
   const b = s.bme680 || {};
   $("bmeTemp").innerHTML = fmtNum(b.temperature_c) + "<small> °C</small>";
   $("bmeHum").innerHTML = fmtNum(b.humidity_pct, 0) + "<small> %</small>";
+  paintBand("kpiCultureTemp", b.temperature_c, s.culture_temp_min, s.culture_temp_max);
+  paintBand("kpiCultureHum", b.humidity_pct, s.culture_hum_min, s.culture_hum_max);
+  $("cultureTempBand").textContent = `${fmtNum(s.culture_temp_min, 1)} – ${fmtNum(s.culture_temp_max, 1)} °C`;
+  $("cultureHumBand").textContent = `${fmtNum(s.culture_hum_min, 0)} – ${fmtNum(s.culture_hum_max, 0)} %`;
 
   setIfIdle("temp", s.target_temp);
   setIfIdle("interval", s.photo_interval_s);
@@ -1385,6 +1530,10 @@ function applyStatus(s) {
   setIfIdle("cameraUrl", s.camera_url);
   setIfIdle("sunLat", s.sun_lat);
   setIfIdle("sunLon", s.sun_lon);
+  setIfIdle("cfgTempMin", s.culture_temp_min);
+  setIfIdle("cfgTempMax", s.culture_temp_max);
+  setIfIdle("cfgHumMin", s.culture_hum_min);
+  setIfIdle("cfgHumMax", s.culture_hum_max);
   $("camMeta").textContent = s.camera_url ? "Flux configuré" : "Pas d'URL";
   $("btnLogout").hidden = !s.auth;
 
@@ -1396,36 +1545,16 @@ function applyStatus(s) {
     : (s.heater_on ? "Chauffe manuelle" : "Veille");
 
   const lightBtn = $("btnLight");
-  lightBtn.textContent = s.light_on ? "Flash off" : "Flash";
   lightBtn.className = s.light_on ? "btn-ghost" : "btn-gold";
   lightBtn.dataset.on = s.light_on ? "1" : "0";
+  lightBtn.setAttribute("aria-pressed", s.light_on ? "true" : "false");
+  lightBtn.setAttribute("aria-label", s.light_on ? "Éteindre le flash" : "Allumer le flash");
 
-  for (const btn of $("lightMode").querySelectorAll("button[data-mode]")) {
-    btn.className = btn.dataset.mode === lightMode ? "btn-gold" : "btn-ghost";
-    btn.setAttribute("aria-pressed", btn.dataset.mode === lightMode ? "true" : "false");
-  }
-  $("lightModeState").textContent = lightMode === "sun" ? "Soleil" : "Manuel";
-
-  const sunEl = Number(s.sun_elevation);
-  const lamp = s.light_on ? "ON" : "OFF";
-  $("sunState").textContent = Number.isFinite(sunEl)
-    ? `${s.sun_up ? "Jour" : "Nuit"} · soleil ${sunEl.toFixed(0)}° · flash ${lamp}`
-    : "—";
-
-  $("btnVentManual").className = s.vent_mode === "manual" ? "btn-gold" : "btn-ghost";
-  $("btnVentCycle").className = s.vent_mode === "cycle" ? "btn-gold" : "btn-ghost";
-  $("btnVentOff").className = s.vent_mode === "off" ? "btn-gold" : "btn-ghost";
-  $("btnVentCycle").textContent = s.vent_mode === "cycle" ? "En cycle" : "Cycle";
-
-  let ventTxt = "Arrêt";
-  if (s.vent_mode === "manual" && s.vent_on) ventTxt = `Manuel ${s.vent_speed} %`;
-  else if (s.vent_mode === "cycle") {
-    ventTxt = s.vent_on
-      ? `Marche · ${fmtRemain(s.vent_remaining_s)}`
-      : `Pause · ${fmtRemain(s.vent_remaining_s)}`;
-  }
-  if (s.vent_actual != null) ventTxt += ` · ${Math.round(s.vent_actual)} %`;
-  $("ventState").textContent = ventTxt;
+  const ventOn = s.vent_mode !== "off";
+  const ventBtn = $("btnVent");
+  ventBtn.className = ventOn ? "btn-ghost" : "btn-gold";
+  ventBtn.setAttribute("aria-pressed", ventOn ? "true" : "false");
+  ventBtn.setAttribute("aria-label", ventOn ? "Arrêter la ventilation" : "Allumer la ventilation");
 }
 
 async function refreshStatus() {
@@ -1636,23 +1765,6 @@ async function applyVentParams() {
   await applyVent(ventMode || "off");
 }
 
-async function applySunPlace(extra = {}) {
-  await api("/api/light", {
-    method: "POST",
-    body: JSON.stringify({ mode: lightMode || "manual", ...sunPlace(), ...extra }),
-  });
-  refreshStatus();
-}
-
-document.querySelectorAll(".btn-step").forEach((btn) => {
-  btn.onclick = () => {
-    const id = btn.dataset.target;
-    const el = $(id);
-    el.value = Number(el.value || 0) + Number(btn.dataset.delta);
-    clampInput(id);
-  };
-});
-
 $("btnSetTemp").onclick = async () => {
   await api("/api/heater", { method: "POST", body: JSON.stringify({ temp: clampInput("temp") }) });
   refreshStatus();
@@ -1667,8 +1779,6 @@ $("btnSetInterval").onclick = async () => {
 $("btnSetVentSpeed").onclick = () => applyVentParams();
 $("btnSetVentInterval").onclick = () => applyVentParams();
 $("btnSetVentDuration").onclick = () => applyVentParams();
-$("btnSetSun").onclick = () => applySunPlace();
-$("btnSetSunLon").onclick = () => applySunPlace();
 
 $("btnStart").onclick = async () => {
   await api("/api/incubator/start", {
@@ -1685,9 +1795,7 @@ $("btnOff").onclick = async () => {
   await api("/api/heater/off", { method: "POST", body: "{}" });
   refreshStatus();
 };
-$("btnVentManual").onclick = () => applyVent("manual");
-$("btnVentCycle").onclick = () => applyVent("cycle");
-$("btnVentOff").onclick = () => applyVent("off");
+$("btnVent").onclick = () => applyVent(ventMode === "off" ? "manual" : "off");
 
 $("btnLight").onclick = async () => {
   const next = $("btnLight").dataset.on !== "1";
@@ -1697,15 +1805,30 @@ $("btnLight").onclick = async () => {
   });
   bumpCam(); refreshStatus();
 };
-$("lightMode").onclick = async (ev) => {
-  const btn = ev.target.closest("button[data-mode]");
-  if (!btn) return;
-  const body = { mode: btn.dataset.mode, ...sunPlace() };
-  if (body.mode === "manual") body.on = $("btnLight").dataset.on === "1";
-  await api("/api/light", { method: "POST", body: JSON.stringify(body) });
-  refreshStatus();
+$("btnSettings").onclick = () => $("cfgDialog").showModal();
+$("cfgCancel").onclick = () => $("cfgDialog").close();
+$("cfgForm").onsubmit = async (ev) => {
+  ev.preventDefault();
+  try {
+    await api("/api/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        culture_temp_min: Number($("cfgTempMin").value),
+        culture_temp_max: Number($("cfgTempMax").value),
+        culture_hum_min: Number($("cfgHumMin").value),
+        culture_hum_max: Number($("cfgHumMax").value),
+        camera_url: $("cameraUrl").value,
+        sun_lat: Number($("sunLat").value),
+        sun_lon: Number($("sunLon").value),
+      }),
+    });
+    $("cfgDialog").close();
+    refreshStatus();
+    bumpCam();
+  } catch (e) {
+    showErr(String(e.message || e));
+  }
 };
-$("btnLightModeApply").onclick = () => applySunPlace();
 
 $("btnSnap").onclick = async () => {
   const r = await api("/api/snapshot", { method: "POST", body: "{}" });
@@ -1713,12 +1836,6 @@ $("btnSnap").onclick = async () => {
   refreshStatus(); refreshGallery(); bumpCam();
 };
 $("btnRefresh").onclick = () => bumpCam();
-$("btnCameraUrl").onclick = async () => {
-  await api("/api/camera", { method: "POST", body: JSON.stringify({ url: $("cameraUrl").value }) });
-  refreshStatus(); bumpCam();
-};
-$("btnCamClear").onclick = () => { $("cameraUrl").value = ""; $("cameraUrl").focus(); };
-$("btnCamDefault").onclick = () => { $("cameraUrl").value = DEFAULT_CAMERA_URL; };
 $("btnLogout").onclick = async () => {
   await api("/api/logout", { method: "POST", body: "{}" });
   location.href = "/login";
@@ -2008,6 +2125,8 @@ class Handler(BaseHTTPRequestHandler):
             if self._reject(path):
                 return
 
+            if path == "/api/settings":
+                return self._json(200, CTRL.update_settings(body))
             if path == "/api/camera":
                 return self._json(200, CTRL.set_camera_url(str(body.get("url") or "")))
             if path == "/api/heater":
