@@ -534,6 +534,14 @@ class IncubatorController:
             self.last_error = ""
             return self.status()
 
+    def set_photo_interval(self, interval_s: int) -> dict[str, Any]:
+        with self.lock:
+            self.photo_interval_s = max(10, int(interval_s))
+            self.last_error = ""
+            if self.incubator_running:
+                self._enqueue({"type": "incubator_start", "temp": self.target_temp})
+            return self.status()
+
     def start_incubator(self, temp_c: float | None = None, interval_s: int | None = None) -> dict[str, Any]:
         with self.lock:
             if temp_c is not None:
@@ -648,23 +656,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Mycelium Lab — Incubateur</title>
+<title>Mycelium Lab — Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@460;560;650&display=swap" rel="stylesheet" />
 <style>
   :root {
-    --bg: #090c0f;
-    --card: #13181d;
+    --bg: #070a0d;
+    --panel: #10151a;
+    --panel-2: #141b22;
     --line: rgba(255,255,255,.08);
-    --text: #f3f6f4;
-    --muted: #8d9893;
+    --text: #eef3f0;
+    --muted: #8b9691;
     --accent: #3ddc97;
     --accent-ink: #062117;
     --danger: #ff6b5a;
     --ok: #3ddc97;
     --warn: #e6b35a;
-    --radius: 18px;
+    --info: #6ec8ff;
+    --radius: 16px;
   }
   * { box-sizing: border-box; }
   body {
@@ -673,89 +683,126 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: Outfit, system-ui, sans-serif;
     color: var(--text);
     background:
-      radial-gradient(900px 420px at 0% -10%, rgba(61,220,151,.12), transparent 55%),
+      radial-gradient(1000px 480px at 8% -12%, rgba(61,220,151,.10), transparent 55%),
+      radial-gradient(800px 420px at 100% 0%, rgba(110,200,255,.06), transparent 50%),
       var(--bg);
   }
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 22px 18px 48px; }
-  header {
-    display: flex; flex-wrap: wrap; align-items: center;
-    justify-content: space-between; gap: 14px; margin-bottom: 18px;
+  .shell { max-width: 1280px; margin: 0 auto; padding: 18px 16px 40px; }
+  .topbar {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 14px;
   }
-  .brand { font-size: 1.35rem; font-weight: 650; letter-spacing: -0.03em; margin: 0; }
+  .brand { margin: 0; font-size: 1.4rem; font-weight: 650; letter-spacing: -.03em; }
   .brand span { color: var(--accent); }
-  .sub { color: var(--muted); margin: 4px 0 0; font-size: .86rem; }
-  .pills { display: flex; flex-wrap: wrap; gap: 8px; }
+  .sub { margin: 4px 0 0; color: var(--muted); font-size: .84rem; }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .pill {
     display: inline-flex; align-items: center; gap: 8px;
     padding: 7px 12px; border: 1px solid var(--line); border-radius: 999px;
-    background: var(--card); font-size: .84rem;
+    background: var(--panel); font-size: .82rem;
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
   .dot.ok { background: var(--ok); }
   .dot.bad { background: var(--danger); }
-  .layout {
-    display: grid; grid-template-columns: 1.45fr .9fr; gap: 14px; align-items: start;
+
+  .kpi {
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 14px;
   }
-  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
-  .stack { display: grid; gap: 14px; }
+  @media (max-width: 1100px) { .kpi { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 620px) { .kpi { grid-template-columns: repeat(2, 1fr); } }
+  .kpi-card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 12px 14px; min-height: 78px;
+  }
+  .kpi-card .label {
+    color: var(--muted); font-size: .7rem; letter-spacing: .06em; text-transform: uppercase;
+  }
+  .kpi-card .value {
+    margin-top: 4px; font-size: 1.55rem; font-weight: 650; letter-spacing: -.03em;
+  }
+  .kpi-card .value small { font-size: .75rem; color: var(--muted); font-weight: 460; }
+
+  .dash {
+    display: grid; grid-template-columns: 1.25fr .95fr; gap: 14px; align-items: start;
+  }
+  @media (max-width: 980px) { .dash { grid-template-columns: 1fr; } }
+
   .panel {
-    background: var(--card); border: 1px solid var(--line);
+    background: var(--panel); border: 1px solid var(--line);
     border-radius: var(--radius); overflow: hidden;
   }
-  .panel h2 {
-    font-size: .78rem; font-weight: 560; letter-spacing: .08em;
+  .panel-h {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 14px 16px 0;
+  }
+  .panel-h h2 {
+    margin: 0; font-size: .74rem; font-weight: 560; letter-spacing: .1em;
     text-transform: uppercase; color: var(--muted);
-    margin: 0; padding: 16px 16px 0;
   }
   .panel .body { padding: 12px 16px 16px; }
-  .cam-frame { position: relative; background: #07090b; aspect-ratio: 16/10; }
+
+  .cam-frame { position: relative; background: #050709; aspect-ratio: 16/10; }
   .cam-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .cam-meta {
     position: absolute; left: 12px; bottom: 12px;
     padding: 5px 10px; border-radius: 999px;
-    background: rgba(9,12,15,.72); border: 1px solid var(--line);
-    font-size: .75rem; color: var(--text); backdrop-filter: blur(8px);
+    background: rgba(7,10,13,.75); border: 1px solid var(--line);
+    font-size: .75rem; backdrop-filter: blur(8px);
   }
-  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 12px; }
-  @media (max-width: 700px) { .stats { grid-template-columns: repeat(2, 1fr); } }
-  .stat { padding: 10px 12px; border-radius: 12px; background: rgba(255,255,255,.03); }
-  .stat .label { color: var(--muted); font-size: .72rem; letter-spacing: .04em; text-transform: uppercase; }
-  .stat .value { font-size: 1.45rem; font-weight: 650; letter-spacing: -0.03em; margin-top: 2px; }
-  .stat .value small { font-size: .78rem; color: var(--muted); font-weight: 460; }
-  label { display: block; font-size: .78rem; color: var(--muted); margin-bottom: 6px; }
-  .row { display: flex; gap: 10px; align-items: end; }
-  .row > div { flex: 1 1 0; min-width: 0; }
-  input[type=number], input[type=text], input[type=password], input[type=url] {
+  .cam-actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+
+  .set-list { display: grid; gap: 10px; }
+  .set-row {
+    display: grid; grid-template-columns: 1fr; gap: 8px;
+    padding: 12px; border-radius: 14px; background: var(--panel-2); border: 1px solid var(--line);
+  }
+  .set-row .head {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  }
+  .set-row .head .name { font-weight: 560; font-size: .92rem; }
+  .set-row .head .unit { color: var(--muted); font-size: .78rem; }
+  .set-ctrl {
+    display: grid; grid-template-columns: 1fr; gap: 8px;
+  }
+  .set-ctrl input[type=number], .set-ctrl input[type=url], .set-ctrl input[type=text] {
     width: 100%; padding: 11px 12px; border-radius: 12px;
-    border: 1px solid var(--line); background: #0c1014; color: var(--text); font: inherit;
+    border: 1px solid var(--line); background: #0b1015; color: var(--text); font: inherit;
   }
-  input:focus { outline: 2px solid rgba(61,220,151,.45); border-color: transparent; }
+  .set-ctrl input:focus { outline: 2px solid rgba(61,220,151,.4); border-color: transparent; }
+  .trio { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 8px; }
+  .trio-modes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+
   button {
     font: inherit; font-weight: 560; border: 0; border-radius: 12px;
-    padding: 10px 14px; cursor: pointer;
+    padding: 10px 12px; cursor: pointer;
   }
   button:disabled { opacity: .45; cursor: not-allowed; }
-  .btn-primary, .btn-gold { background: var(--accent); color: var(--accent-ink); }
+  .btn-gold, .btn-primary { background: var(--accent); color: var(--accent-ink); }
   .btn-ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
-  .btn-danger { background: rgba(255,107,90,.16); color: #ffd0ca; }
-  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-  .actions.split { display: grid; grid-template-columns: 1fr 1fr; }
+  .btn-danger { background: rgba(255,107,90,.16); color: #ffd0ca; border: 1px solid rgba(255,107,90,.25); }
+  .btn-ghost[aria-pressed="true"], .trio-modes .btn-gold { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+
+  .modes { display: grid; gap: 10px; margin-top: 4px; }
+  .mode-block {
+    padding: 12px; border-radius: 14px; background: var(--panel-2); border: 1px solid var(--line);
+  }
+  .mode-block .head { margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; }
+  .mode-block .name { font-weight: 560; font-size: .92rem; }
+  .mode-block .state { color: var(--muted); font-size: .78rem; text-align: right; }
+
   .hint { color: var(--muted); font-size: .8rem; margin: 10px 0 0; line-height: 1.45; }
   .err {
     margin-top: 10px; padding: 10px 12px; border-radius: 12px;
     background: rgba(255,107,90,.12); color: #ffd0ca; font-size: .84rem; display: none;
   }
   .err.show { display: block; }
-  .gallery {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
-    gap: 8px; max-height: 240px; overflow: auto;
-  }
-  .gallery a { display: block; border-radius: 12px; overflow: hidden; background: #000; }
-  .gallery img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
+
+  .below { display: grid; gap: 14px; margin-top: 14px; }
   .seg { display: inline-flex; flex-wrap: wrap; gap: 6px; }
   .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
   .chart-wrap {
-    position: relative; width: 100%; height: 260px; margin-top: 8px;
+    position: relative; width: 100%; height: 280px; margin-top: 10px;
     border-radius: 12px; background: rgba(255,255,255,.03); border: 1px solid var(--line);
   }
   .chart-wrap canvas { width: 100%; height: 100%; display: block; }
@@ -765,12 +812,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
   .swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
-  footer { margin-top: 18px; color: var(--muted); font-size: .75rem; }
+  .gallery {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+    gap: 8px; max-height: 260px; overflow: auto;
+  }
+  .gallery a { display: block; border-radius: 12px; overflow: hidden; background: #000; }
+  .gallery img { width: 100%; aspect-ratio: 1; object-fit: cover; display: block; }
+  footer { margin-top: 16px; color: var(--muted); font-size: .75rem; }
 </style>
 </head>
 <body>
-  <div class="wrap">
-    <header>
+  <div class="shell">
+    <header class="topbar">
       <div>
         <h1 class="brand">Mycelium <span>Lab</span></h1>
         <p class="sub" id="identity">En attente du relais…</p>
@@ -778,155 +831,182 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="pills">
         <div class="pill"><span class="dot" id="dotLink"></span><span id="linkLabel">Relais</span></div>
         <div class="pill"><span class="dot" id="dot"></span><span id="connLabel">—</span></div>
+        <button type="button" class="btn-ghost" id="btnLogout" hidden>Sortir</button>
       </div>
     </header>
 
-    <div class="layout">
+    <section class="kpi" aria-label="Mesures">
+      <div class="kpi-card"><div class="label">Plateau</div><div class="value" id="bedActual">—<small> °C</small></div></div>
+      <div class="kpi-card"><div class="label">Consigne</div><div class="value" id="bedTarget">—<small> °C</small></div></div>
+      <div class="kpi-card"><div class="label">Air BME</div><div class="value" id="bmeTemp">—<small> °C</small></div></div>
+      <div class="kpi-card"><div class="label">Humidité</div><div class="value" id="bmeHum">—<small> %</small></div></div>
+      <div class="kpi-card"><div class="label">Air box</div><div class="value" id="ventActual">—<small> %</small></div></div>
+      <div class="kpi-card"><div class="label">Photos</div><div class="value" id="photoCount">0</div></div>
+    </section>
+
+    <div class="dash">
       <section class="panel">
+        <div class="panel-h"><h2>Live</h2><span class="hint" id="camMeta" style="margin:0">Flux</span></div>
         <div class="cam-frame">
           <img id="cam" alt="Caméra incubateur" src="/api/camera.jpg" />
-          <div class="cam-meta" id="camMeta">Flux</div>
         </div>
         <div class="body">
-          <div class="stats">
-            <div class="stat">
-              <div class="label">Plateau</div>
-              <div class="value" id="bedActual">—<small> °C</small></div>
-            </div>
-            <div class="stat">
-              <div class="label">Consigne</div>
-              <div class="value" id="bedTarget">—<small> °C</small></div>
-            </div>
-            <div class="stat">
-              <div class="label">Air BME</div>
-              <div class="value" id="bmeTemp">—<small> °C</small></div>
-            </div>
-            <div class="stat">
-              <div class="label">Humidité</div>
-              <div class="value" id="bmeHum">—<small> %</small></div>
-            </div>
-          </div>
-          <div class="stats" style="margin-top:8px">
-            <div class="stat">
-              <div class="label">Photos</div>
-              <div class="value" id="photoCount">0</div>
-            </div>
-            <div class="stat">
-              <div class="label">Air box</div>
-              <div class="value" id="ventActual">—<small> %</small></div>
-            </div>
-          </div>
-          <div class="actions">
-            <button class="btn-gold" id="btnLight">Flash</button>
-            <button class="btn-ghost" id="btnSnap">Photo</button>
-            <button class="btn-ghost" id="btnRefresh">Rafraîchir</button>
+          <div class="cam-actions">
+            <button type="button" class="btn-gold" id="btnLight">Flash</button>
+            <button type="button" class="btn-ghost" id="btnSnap">Photo</button>
+            <button type="button" class="btn-ghost" id="btnRefresh">Rafraîchir</button>
           </div>
         </div>
       </section>
 
-      <div class="stack">
-        <section class="panel">
-          <h2>Caméra</h2>
-          <div class="body">
-            <label for="cameraUrl">URL du flux (MJPEG)</label>
-            <input id="cameraUrl" type="url" placeholder="http://192.168.1.20:3031/video" autocomplete="off" spellcheck="false" />
-            <div class="actions">
-              <button class="btn-gold" id="btnCameraUrl" type="button">Enregistrer</button>
-              <button class="btn-ghost" id="btnLogout" type="button" hidden>Sortir</button>
-            </div>
-            <p class="hint">Doit être joignable depuis le serveur (VPN / Tailscale). Exemple Centauri : port 3031.</p>
-          </div>
-        </section>
-
-        <section class="panel">
-          <h2>Chaleur</h2>
-          <div class="body">
-            <div class="row">
-              <div>
-                <label for="temp">Plateau °C</label>
+      <section class="panel">
+        <div class="panel-h"><h2>Consignes</h2></div>
+        <div class="body">
+          <div class="set-list">
+            <div class="set-row">
+              <div class="head"><span class="name">Température plateau</span><span class="unit">°C</span></div>
+              <div class="set-ctrl">
                 <input id="temp" type="number" min="0" max="110" step="0.5" value="22" />
-              </div>
-              <div>
-                <label for="interval">Photo / s</label>
-                <input id="interval" type="number" min="10" step="10" value="1800" />
+                <div class="trio">
+                  <button type="button" class="btn-ghost btn-step" data-target="temp" data-delta="-0.5">−</button>
+                  <button type="button" class="btn-gold" id="btnSetTemp">Appliquer</button>
+                  <button type="button" class="btn-ghost btn-step" data-target="temp" data-delta="0.5">+</button>
+                </div>
               </div>
             </div>
-            <div class="actions split">
-              <button class="btn-gold" id="btnSetTemp">Appliquer</button>
-              <button class="btn-primary" id="btnStart">Démarrer</button>
-              <button class="btn-ghost" id="btnStopKeep">Pause</button>
-              <button class="btn-danger" id="btnOff">Éteindre</button>
-            </div>
-            <p class="hint" id="runState">Veille</p>
-            <div class="err" id="err"></div>
-          </div>
-        </section>
 
-        <section class="panel">
-          <h2>Air</h2>
-          <div class="body">
-            <div class="row">
-              <div>
-                <label for="ventSpeed">%</label>
+            <div class="set-row">
+              <div class="head"><span class="name">Intervalle photo</span><span class="unit">secondes</span></div>
+              <div class="set-ctrl">
+                <input id="interval" type="number" min="10" step="10" value="1800" />
+                <div class="trio">
+                  <button type="button" class="btn-ghost btn-step" data-target="interval" data-delta="-10">−</button>
+                  <button type="button" class="btn-gold" id="btnSetInterval">Appliquer</button>
+                  <button type="button" class="btn-ghost btn-step" data-target="interval" data-delta="10">+</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-row">
+              <div class="head"><span class="name">Vitesse ventilation</span><span class="unit">%</span></div>
+              <div class="set-ctrl">
                 <input id="ventSpeed" type="number" min="0" max="100" step="5" value="60" />
+                <div class="trio">
+                  <button type="button" class="btn-ghost btn-step" data-target="ventSpeed" data-delta="-5">−</button>
+                  <button type="button" class="btn-gold" id="btnSetVentSpeed">Appliquer</button>
+                  <button type="button" class="btn-ghost btn-step" data-target="ventSpeed" data-delta="5">+</button>
+                </div>
               </div>
-              <div>
-                <label for="ventInterval">Tous les s</label>
+            </div>
+
+            <div class="set-row">
+              <div class="head"><span class="name">Cycle — tous les</span><span class="unit">secondes</span></div>
+              <div class="set-ctrl">
                 <input id="ventInterval" type="number" min="30" step="30" value="1800" />
+                <div class="trio">
+                  <button type="button" class="btn-ghost btn-step" data-target="ventInterval" data-delta="-30">−</button>
+                  <button type="button" class="btn-gold" id="btnSetVentInterval">Appliquer</button>
+                  <button type="button" class="btn-ghost btn-step" data-target="ventInterval" data-delta="30">+</button>
+                </div>
               </div>
-              <div>
-                <label for="ventDuration">Pendant s</label>
+            </div>
+
+            <div class="set-row">
+              <div class="head"><span class="name">Cycle — pendant</span><span class="unit">secondes</span></div>
+              <div class="set-ctrl">
                 <input id="ventDuration" type="number" min="5" step="5" value="120" />
+                <div class="trio">
+                  <button type="button" class="btn-ghost btn-step" data-target="ventDuration" data-delta="-5">−</button>
+                  <button type="button" class="btn-gold" id="btnSetVentDuration">Appliquer</button>
+                  <button type="button" class="btn-ghost btn-step" data-target="ventDuration" data-delta="5">+</button>
+                </div>
               </div>
             </div>
-            <div class="actions">
-              <button class="btn-gold" id="btnVentManual">Manuel</button>
-              <button class="btn-primary" id="btnVentCycle">Cycle</button>
-              <button class="btn-ghost" id="btnVentOff">Stop</button>
+
+            <div class="set-row">
+              <div class="head"><span class="name">URL caméra</span><span class="unit">MJPEG</span></div>
+              <div class="set-ctrl">
+                <input id="cameraUrl" type="url" placeholder="http://192.168.1.20:3031/video" autocomplete="off" spellcheck="false" />
+                <div class="trio">
+                  <button type="button" class="btn-ghost" id="btnCamClear" title="Vider">×</button>
+                  <button type="button" class="btn-gold" id="btnCameraUrl">Appliquer</button>
+                  <button type="button" class="btn-ghost" id="btnCamDefault" title="Défaut">↺</button>
+                </div>
+              </div>
             </div>
-            <p class="hint" id="ventState">Arrêt</p>
           </div>
-        </section>
-      </div>
+
+          <div class="modes" style="margin-top:12px">
+            <div class="mode-block">
+              <div class="head">
+                <span class="name">Incubateur</span>
+                <span class="state" id="runState">Veille</span>
+              </div>
+              <div class="trio-modes">
+                <button type="button" class="btn-gold" id="btnStart">Démarrer</button>
+                <button type="button" class="btn-ghost" id="btnStopKeep">Pause</button>
+                <button type="button" class="btn-danger" id="btnOff">Éteindre</button>
+              </div>
+            </div>
+            <div class="mode-block">
+              <div class="head">
+                <span class="name">Ventilation</span>
+                <span class="state" id="ventState">Arrêt</span>
+              </div>
+              <div class="trio-modes">
+                <button type="button" class="btn-ghost" id="btnVentManual">Manuel</button>
+                <button type="button" class="btn-ghost" id="btnVentCycle">Cycle</button>
+                <button type="button" class="btn-ghost" id="btnVentOff">Stop</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="err" id="err"></div>
+        </div>
+      </section>
     </div>
 
-    <section class="panel" style="margin-top:14px">
-      <h2>Historique</h2>
-      <div class="body">
-        <div class="actions" style="margin-top:0;justify-content:space-between;align-items:center">
-          <div class="seg" id="chartWindow" role="group" aria-label="Fenêtre">
-            <button type="button" class="btn-ghost" data-window="5m">5 min</button>
-            <button type="button" class="btn-ghost" data-window="60m" aria-pressed="true">60 min</button>
-            <button type="button" class="btn-ghost" data-window="24h">24 h</button>
-          </div>
+    <div class="below">
+      <section class="panel">
+        <div class="panel-h">
+          <h2>Historique</h2>
           <span class="hint" id="chartMeta" style="margin:0">—</span>
         </div>
-        <div class="chart-wrap"><canvas id="metricsChart" width="1100" height="260"></canvas></div>
-        <div class="chart-legend">
-          <span><i class="swatch" style="background:#3ddc97"></i>Plateau</span>
-          <span><i class="swatch" style="background:#e6b35a"></i>Consigne</span>
-          <span><i class="swatch" style="background:#6ec8ff"></i>Air BME</span>
-          <span><i class="swatch" style="background:#c9a0ff"></i>Humidité %</span>
+        <div class="body">
+          <div class="toolbar">
+            <div class="seg" id="chartWindow" role="group" aria-label="Fenêtre">
+              <button type="button" class="btn-ghost" data-window="5m">5 min</button>
+              <button type="button" class="btn-ghost" data-window="60m" aria-pressed="true">60 min</button>
+              <button type="button" class="btn-ghost" data-window="24h">24 h</button>
+            </div>
+            <button type="button" class="btn-ghost" id="btnMetrics">Télécharger CSV</button>
+          </div>
+          <div class="chart-wrap"><canvas id="metricsChart" width="1100" height="280"></canvas></div>
+          <div class="chart-legend">
+            <span><i class="swatch" style="background:#3ddc97"></i>Plateau</span>
+            <span><i class="swatch" style="background:#e6b35a"></i>Consigne</span>
+            <span><i class="swatch" style="background:#6ec8ff"></i>Air BME</span>
+            <span><i class="swatch" style="background:#c9a0ff"></i>Humidité %</span>
+          </div>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="panel" style="margin-top:14px">
-      <h2>Time-lapse</h2>
-      <div class="body">
-        <p class="hint" style="margin-top:0">Photos + journal CSV (températures, consigne, ventilation) à chaque télémétrie.</p>
-        <div class="actions" style="margin-top:0;margin-bottom:10px">
-          <button type="button" class="btn-gold" id="btnMetrics">Télécharger metrics.csv</button>
+      <section class="panel">
+        <div class="panel-h"><h2>Time-lapse</h2></div>
+        <div class="body">
+          <div class="gallery" id="gallery"></div>
         </div>
-        <div class="gallery" id="gallery"></div>
-      </div>
-    </section>
+      </section>
+    </div>
 
     <footer>Relais ESP32 · Centauri Carbon · BME680</footer>
   </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
+const DEFAULT_CAMERA_URL = "http://192.168.1.20:3031/video";
+let ventMode = "off";
+let incubatorRunning = false;
 
 async function api(path, opts) {
   const r = await fetch(path, {
@@ -960,8 +1040,34 @@ function fmtNum(v, digits=1) {
   return Number(v).toFixed(digits);
 }
 
+function clampInput(id) {
+  const el = $(id);
+  const min = el.min !== "" ? Number(el.min) : -Infinity;
+  const max = el.max !== "" ? Number(el.max) : Infinity;
+  const step = el.step !== "" ? Number(el.step) : 1;
+  let v = Number(el.value);
+  if (!Number.isFinite(v)) v = min;
+  v = Math.min(max, Math.max(min, v));
+  if (Number.isFinite(step) && step > 0) {
+    const precision = String(step).includes(".") ? String(step).split(".")[1].length : 0;
+    v = Number(v.toFixed(precision));
+  }
+  el.value = v;
+  return v;
+}
+
+function showErr(msg) {
+  const err = $("err");
+  if (!msg) { err.classList.remove("show"); err.textContent = ""; return; }
+  err.textContent = msg;
+  err.classList.add("show");
+}
+
 function applyStatus(s) {
   const linkOnline = !!(s.link && s.link.online);
+  incubatorRunning = !!s.incubator_running;
+  ventMode = s.vent_mode || "off";
+
   $("identity").textContent = `${s.machine_name} · FW ${s.firmware} · ${s.printer_ip || "—"}`;
   $("dot").className = "dot " + (s.connected ? "ok" : "bad");
   $("connLabel").textContent = s.connected
@@ -990,43 +1096,39 @@ function applyStatus(s) {
   $("camMeta").textContent = s.camera_url ? "Flux configuré" : "Pas d'URL";
   $("btnLogout").hidden = !s.auth;
 
-  const err = $("err");
-  if (s.last_error) { err.textContent = s.last_error; err.classList.add("show"); }
-  else err.classList.remove("show");
+  if (s.last_error) showErr(s.last_error);
+  else showErr("");
 
   $("runState").textContent = s.incubator_running
-    ? `État : incubateur ON · dernière photo ${s.last_photo || "—"}`
-    : (s.heater_on ? "État : chauffe manuelle" : "État : veille");
+    ? `ON · ${s.last_photo || "—"}`
+    : (s.heater_on ? "Chauffe manuelle" : "Veille");
 
   const lightBtn = $("btnLight");
   lightBtn.textContent = s.light_on ? "Flash off" : "Flash";
   lightBtn.className = s.light_on ? "btn-ghost" : "btn-gold";
   lightBtn.dataset.on = s.light_on ? "1" : "0";
 
-  const manualBtn = $("btnVentManual");
-  const cycleBtn = $("btnVentCycle");
-  manualBtn.className = s.vent_mode === "manual" ? "btn-gold" : "btn-ghost";
-  cycleBtn.className = s.vent_mode === "cycle" ? "btn-primary" : "btn-ghost";
-  cycleBtn.textContent = s.vent_mode === "cycle" ? "En cycle" : "Cycle";
-  let ventTxt = "Ventilation : arrêt";
-  if (s.vent_mode === "manual" && s.vent_on) {
-    ventTxt = `Ventilation : manuelle ${s.vent_speed} %`;
-  } else if (s.vent_mode === "cycle") {
+  $("btnVentManual").className = s.vent_mode === "manual" ? "btn-gold" : "btn-ghost";
+  $("btnVentCycle").className = s.vent_mode === "cycle" ? "btn-gold" : "btn-ghost";
+  $("btnVentOff").className = s.vent_mode === "off" ? "btn-gold" : "btn-ghost";
+  $("btnVentCycle").textContent = s.vent_mode === "cycle" ? "En cycle" : "Cycle";
+
+  let ventTxt = "Arrêt";
+  if (s.vent_mode === "manual" && s.vent_on) ventTxt = `Manuel ${s.vent_speed} %`;
+  else if (s.vent_mode === "cycle") {
     ventTxt = s.vent_on
-      ? `Ventilation : cycle en marche · encore ${fmtRemain(s.vent_remaining_s)}`
-      : `Ventilation : cycle en pause · prochain dans ${fmtRemain(s.vent_remaining_s)}`;
+      ? `Marche · ${fmtRemain(s.vent_remaining_s)}`
+      : `Pause · ${fmtRemain(s.vent_remaining_s)}`;
   }
-  if (s.vent_actual != null) ventTxt += ` · mesuré ${Math.round(s.vent_actual)} %`;
+  if (s.vent_actual != null) ventTxt += ` · ${Math.round(s.vent_actual)} %`;
   $("ventState").textContent = ventTxt;
 }
 
 async function refreshStatus() {
   try {
-    const s = await api("/api/status");
-    applyStatus(s);
+    applyStatus(await api("/api/status"));
   } catch (e) {
-    $("err").textContent = String(e.message || e);
-    $("err").classList.add("show");
+    showErr(String(e.message || e));
   }
 }
 
@@ -1041,11 +1143,7 @@ async function refreshGallery() {
 $("btnMetrics").onclick = async () => {
   const r = await fetch("/api/metrics.csv", { credentials: "same-origin" });
   if (r.status === 401) { location.href = "/login"; return; }
-  if (!r.ok) {
-    $("err").textContent = "CSV indisponible";
-    $("err").classList.add("show");
-    return;
-  }
+  if (!r.ok) { showErr("CSV indisponible"); return; }
   const blob = await r.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -1077,7 +1175,7 @@ function drawMetricsChart(points) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth || 1100;
-  const cssH = canvas.clientHeight || 260;
+  const cssH = canvas.clientHeight || 280;
   canvas.width = Math.round(cssW * dpr);
   canvas.height = Math.round(cssH * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1086,12 +1184,11 @@ function drawMetricsChart(points) {
   const pad = { l: 44, r: 44, t: 16, b: 28 };
   const w = cssW - pad.l - pad.r;
   const h = cssH - pad.t - pad.b;
-
   ctx.fillStyle = "rgba(255,255,255,.03)";
   ctx.fillRect(0, 0, cssW, cssH);
 
   if (!points.length) {
-    ctx.fillStyle = "#8d9893";
+    ctx.fillStyle = "#8b9691";
     ctx.font = "14px Outfit, system-ui, sans-serif";
     ctx.textAlign = "center";
     ctx.fillText("Pas encore de données sur cette fenêtre", cssW / 2, cssH / 2);
@@ -1117,7 +1214,7 @@ function drawMetricsChart(points) {
   ctx.lineWidth = 1;
   ctx.font = "11px Outfit, system-ui, sans-serif";
   ctx.textAlign = "right";
-  ctx.fillStyle = "#8d9893";
+  ctx.fillStyle = "#8b9691";
   for (let i = 0; i <= 4; i++) {
     const y = pad.t + (i / 4) * h;
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + w, y); ctx.stroke();
@@ -1152,8 +1249,7 @@ function drawMetricsChart(points) {
     }
     ctx.strokeStyle = s.color;
     ctx.lineWidth = s.key === "consigne_c" ? 1.5 : 2;
-    if (s.key === "consigne_c") ctx.setLineDash([5, 4]);
-    else ctx.setLineDash([]);
+    ctx.setLineDash(s.key === "consigne_c" ? [5, 4] : []);
     ctx.stroke();
     ctx.setLineDash([]);
   }
@@ -1186,14 +1282,53 @@ function bumpCam() {
   $("cam").src = "/api/camera.jpg?t=" + Date.now();
 }
 
+function ventBody(mode) {
+  return JSON.stringify({
+    mode,
+    speed: clampInput("ventSpeed"),
+    interval_s: clampInput("ventInterval"),
+    duration_s: clampInput("ventDuration"),
+  });
+}
+
+async function applyVent(mode) {
+  await api("/api/vent", { method: "POST", body: ventBody(mode) });
+  refreshStatus();
+}
+
+async function applyVentParams() {
+  await applyVent(ventMode || "off");
+}
+
+document.querySelectorAll(".btn-step").forEach((btn) => {
+  btn.onclick = () => {
+    const id = btn.dataset.target;
+    const el = $(id);
+    const delta = Number(btn.dataset.delta);
+    el.value = Number(el.value || 0) + delta;
+    clampInput(id);
+  };
+});
+
 $("btnSetTemp").onclick = async () => {
-  await api("/api/heater", { method: "POST", body: JSON.stringify({ temp: +$("temp").value }) });
+  await api("/api/heater", { method: "POST", body: JSON.stringify({ temp: clampInput("temp") }) });
   refreshStatus();
 };
+$("btnSetInterval").onclick = async () => {
+  await api("/api/incubator/interval", {
+    method: "POST",
+    body: JSON.stringify({ interval_s: clampInput("interval") }),
+  });
+  refreshStatus();
+};
+$("btnSetVentSpeed").onclick = () => applyVentParams();
+$("btnSetVentInterval").onclick = () => applyVentParams();
+$("btnSetVentDuration").onclick = () => applyVentParams();
+
 $("btnStart").onclick = async () => {
   await api("/api/incubator/start", {
     method: "POST",
-    body: JSON.stringify({ temp: +$("temp").value, interval_s: +$("interval").value }),
+    body: JSON.stringify({ temp: clampInput("temp"), interval_s: clampInput("interval") }),
   });
   refreshStatus(); bumpCam(); refreshGallery();
 };
@@ -1205,26 +1340,10 @@ $("btnOff").onclick = async () => {
   await api("/api/heater/off", { method: "POST", body: "{}" });
   refreshStatus();
 };
-function ventBody(mode) {
-  return JSON.stringify({
-    mode,
-    speed: +$("ventSpeed").value,
-    interval_s: +$("ventInterval").value,
-    duration_s: +$("ventDuration").value,
-  });
-}
-$("btnVentManual").onclick = async () => {
-  await api("/api/vent", { method: "POST", body: ventBody("manual") });
-  refreshStatus();
-};
-$("btnVentCycle").onclick = async () => {
-  await api("/api/vent", { method: "POST", body: ventBody("cycle") });
-  refreshStatus();
-};
-$("btnVentOff").onclick = async () => {
-  await api("/api/vent", { method: "POST", body: ventBody("off") });
-  refreshStatus();
-};
+$("btnVentManual").onclick = () => applyVent("manual");
+$("btnVentCycle").onclick = () => applyVent("cycle");
+$("btnVentOff").onclick = () => applyVent("off");
+
 $("btnLight").onclick = async () => {
   const next = $("btnLight").dataset.on !== "1";
   await api("/api/light", { method: "POST", body: JSON.stringify({ on: next }) });
@@ -1232,7 +1351,7 @@ $("btnLight").onclick = async () => {
 };
 $("btnSnap").onclick = async () => {
   const r = await api("/api/snapshot", { method: "POST", body: "{}" });
-  if (!r.ok) { $("err").textContent = r.error || "Échec"; $("err").classList.add("show"); }
+  if (!r.ok) showErr(r.error || "Échec");
   refreshStatus(); refreshGallery(); bumpCam();
 };
 $("btnRefresh").onclick = () => bumpCam();
@@ -1240,6 +1359,8 @@ $("btnCameraUrl").onclick = async () => {
   await api("/api/camera", { method: "POST", body: JSON.stringify({ url: $("cameraUrl").value }) });
   refreshStatus(); bumpCam();
 };
+$("btnCamClear").onclick = () => { $("cameraUrl").value = ""; $("cameraUrl").focus(); };
+$("btnCamDefault").onclick = () => { $("cameraUrl").value = DEFAULT_CAMERA_URL; };
 $("btnLogout").onclick = async () => {
   await api("/api/logout", { method: "POST", body: "{}" });
   location.href = "/login";
@@ -1542,6 +1663,11 @@ class Handler(BaseHTTPRequestHandler):
                         temp_c=body.get("temp"),
                         interval_s=body.get("interval_s"),
                     ),
+                )
+            if path == "/api/incubator/interval":
+                return self._json(
+                    200,
+                    CTRL.set_photo_interval(int(body.get("interval_s", CTRL.photo_interval_s))),
                 )
             if path == "/api/incubator/stop":
                 return self._json(
