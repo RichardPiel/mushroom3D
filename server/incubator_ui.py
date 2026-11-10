@@ -1994,7 +1994,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
         <div class="body">
           <div class="cam-actions">
-            <button type="button" class="btn-gold" id="btnLight" title="Flash" aria-label="Allumer le flash" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/></svg></button>
             <button type="button" class="btn-gold" id="btnVent" title="Ventilation" aria-label="Allumer la ventilation" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/><path d="M12 10c-1.8-3.2-1.6-6.2.2-8 2.6 2 2.4 5.2-.2 8zM14 12c3.2-1.8 6.2-1.6 8 .2-2 2.6-5.2 2.4-8-.2zM12 14c1.8 3.2 1.6 6.2-.2 8-2.6-2-2.4-5.2.2-8zM10 12c-3.2 1.8-6.2 1.6-8-.2 2-2.6 5.2-2.4 8 .2z"/></svg></button>
             <button type="button" class="btn-ghost" id="btnSnap" title="Photo" aria-label="Prendre une photo"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M9 4h6l1.2 2H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3.8L9 4zm3 5a5 5 0 1 0 .01 10.01A5 5 0 0 0 12 9zm0 2a3 3 0 1 1 0 6 3 3 0 0 1 0-6z"/></svg></button>
             <button type="button" class="btn-ghost" id="btnRefresh" title="Rafraîchir" aria-label="Rafraîchir le flux"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A8 8 0 1 0 19.73 14h-2.09a6 6 0 1 1-1.58-5.9L13 11V4h7l-2.35 2.35z"/></svg></button>
@@ -2224,10 +2223,6 @@ function showErr(msg) {
   err.classList.add("show");
 }
 
-function sunPlace() {
-  return { lat: clampInput("sunLat"), lon: clampInput("sunLon") };
-}
-
 function applyStatus(s) {
   const linkOnline = !!(s.link && s.link.online);
   ventMode = s.vent_mode || "off";
@@ -2303,13 +2298,6 @@ function applyStatus(s) {
     ? `ON · ${regime}${cooling} · photo / ${s.photo_interval_s} s · prochaine ${fmtRemain(s.photo_next_s)}`
     : (s.heat_forced || s.heater_on ? "Chauffe forcée" : "Veille");
   $("btnHeatAuto").hidden = !s.heat_forced;
-
-  const lightBtn = $("btnLight");
-  const lightShown = s.light_mode === "manual" ? !!s.light_target : !!s.light_on;
-  lightBtn.className = lightShown ? "btn-ghost" : "btn-gold";
-  lightBtn.dataset.on = lightShown ? "1" : "0";
-  lightBtn.setAttribute("aria-pressed", lightShown ? "true" : "false");
-  lightBtn.setAttribute("aria-label", lightShown ? "Éteindre le flash" : "Allumer le flash");
 
   const ventOn = s.vent_mode !== "off";
   const ventBtn = $("btnVent");
@@ -2804,14 +2792,6 @@ $("btnOff").onclick = async () => {
 };
 $("btnVent").onclick = () => applyVent(ventMode === "off" ? "manual" : "off");
 
-$("btnLight").onclick = async () => {
-  const next = $("btnLight").dataset.on !== "1";
-  await api("/api/light", {
-    method: "POST",
-    body: JSON.stringify({ on: next, mode: "manual", ...sunPlace() }),
-  });
-  bumpCam(); refreshStatus();
-};
 $("btnSettings").onclick = () => $("cfgDialog").showModal();
 $("cfgCancel").onclick = () => $("cfgDialog").close();
 $("cfgForm").onsubmit = async (ev) => {
