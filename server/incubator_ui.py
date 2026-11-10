@@ -2,7 +2,7 @@
 """
 incubator_ui.py — Interface web distante pour l'incubateur.
 
-    INCUBATOR_PASSWORD=… RELAY_TOKEN=… python3 incubator_ui.py
+    INCUBATOR_PASSWORD=os.environ.get( RELAY_TOKEN=os.environ.get( python3 incubator_ui.py
     → http://127.0.0.1:8765
 
 La carte ESP32 (salon) pousse la télémétrie et tire les ordres.
@@ -332,6 +332,7 @@ class IncubatorController:
         self.heater_on = False
         self.incubator_running = False
         self.light_on = False
+        self.light_known = False
         self.light_target = False
         self.light_mode = cfg.get("light_mode") if cfg.get("light_mode") in ("manual", "sun") else "manual"
         self.sun_lat = _cfg_float(cfg, "sun_lat", _env_float("SUN_LAT", DEFAULT_SUN_LAT))
@@ -526,7 +527,10 @@ class IncubatorController:
                 self.chamber_c = float(printer["chamber_c"])
             if printer.get("chamber_target_c") is not None:
                 self.chamber_target_c = float(printer["chamber_target_c"])
-            if "light_on" in printer:
+            if printer.get("light_known"):
+                self.light_known = True
+                self.light_on = bool(printer.get("light_on"))
+            elif "light_known" not in printer and "light_on" in printer:
                 self.light_on = bool(printer["light_on"])
             if printer.get("box_fan") is not None:
                 self.vent_actual = float(printer["box_fan"])
@@ -559,8 +563,6 @@ class IncubatorController:
                 self.vent_duration_s = int(desired["vent_duration_s"])
             if desired.get("vent_remaining_s") is not None:
                 self.vent_remaining_s = int(desired["vent_remaining_s"])
-            if "light_on" in desired:
-                self.light_on = bool(desired["light_on"])
 
             self._append_metrics()
             return {"ok": True}
@@ -748,21 +750,21 @@ class IncubatorController:
     def _ensure_light(self, on: bool, *, force: bool = False) -> None:
         """Hold the lamp on the target. Caller holds self.lock.
 
-        A single order is easy to lose, and the relay then reports the old state.
-        Retry quickly while the reported lamp differs, and refresh every 30 s so
-        the printer does not drop the LED.
+        Cmd 403 toggles the chamber lamp, so a periodic refresh turns it off.
+        Send only when the target changes or the printer reports the other state.
         """
         on = bool(on)
         changed = on != self.light_target
         self.light_target = on
+        if self.light_known and self.light_on == on:
+            return
         pending_same = any(
             cmd.get("type") == "light" and bool(cmd.get("on")) == on for cmd in self.commands
         )
         if pending_same and not force:
             return
         elapsed = time.monotonic() - self._last_light_cmd
-        mismatch = self.light_on != on
-        if force or changed or (mismatch and elapsed >= 5) or elapsed >= 30:
+        if force or changed or elapsed >= 12:
             self._queue_light(on)
 
     def set_light(

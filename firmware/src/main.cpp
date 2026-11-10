@@ -51,20 +51,6 @@ bool applyVent(bool on) {
   return ok;
 }
 
-void tickLight() {
-  // La Centauri lâche parfois la LED : on la réapplique tant que l'ordre est ON.
-  if (!desired.light_on) {
-    return;
-  }
-  const uint32_t now = millis();
-  if (now - last_light_ms < 30000) {
-    return;
-  }
-  if (printer.setLight(true)) {
-    last_light_ms = now;
-  }
-}
-
 void tickVentilation() {
   const uint32_t now = millis();
   if (desired.vent_mode == "cycle") {
@@ -126,7 +112,15 @@ void handleCommand(JsonObjectConst cmd, JsonObject result) {
     } else if (!cmd["on"].isNull()) {
       on = cmd["on"].as<int>() != 0;
     }
-    if (printer.setLight(on)) {
+    // Cmd 403 bascule la lampe : renvoyer le même état l'éteint.
+    const bool known = printer.state().light_known;
+    const bool same = known && printer.state().light_on == on;
+    const bool recent = desired.light_on == on && last_light_ms != 0 &&
+                        millis() - last_light_ms < 8000;
+    if (same || recent) {
+      desired.light_on = on;
+      result["ok"] = true;
+    } else if (printer.setLight(on)) {
       desired.light_on = on;
       last_light_ms = millis();
       result["ok"] = true;
@@ -259,7 +253,6 @@ void loop() {
   }
 
   tickVentilation();
-  tickLight();
 
   if (desired.heater_on && now - last_heater_ms >= HEATER_KEEPALIVE_MS) {
     if (printer.setBedTemperature(desired.target_temp)) {
