@@ -20,6 +20,8 @@
           "bed_actual": 52.1,
           "bed_target": 52.0,
           "nozzle_actual": 24.0,
+          "chamber_c": 28.4,
+          "chamber_target_c": 0,
           "light_on": false,
           "box_fan": 0,
           "camera_url": "http://192.168.1.20:3031/video"

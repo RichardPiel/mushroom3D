@@ -5,6 +5,7 @@
 #include <WiFiClientSecure.h>
 
 #include <cmath>
+#include <memory>
 
 ServerLink::ServerLink(const char *base_url, const char *token)
     : base_(base_url), token_(token) {
@@ -22,12 +23,18 @@ LinkResult ServerLink::request(const char *method, const String &path, const Str
     return out;
   }
   String url = base_ + path;
+  // WiFiClientSecure est gros et doit survivre à HTTPClient : sur la pile de loop()
+  // sa destruction appelait une méthode nulle et rebootait en boucle.
+  std::unique_ptr<WiFiClientSecure> secure;
   HTTPClient http;
-  WiFiClientSecure secure;
-  bool tls = url.startsWith("https://");
+  const bool tls = url.startsWith("https://");
   if (tls) {
-    secure.setInsecure();
-    if (!http.begin(secure, url)) {
+    secure.reset(new (std::nothrow) WiFiClientSecure());
+    if (!secure) {
+      return out;
+    }
+    secure->setInsecure();
+    if (!http.begin(*secure, url)) {
       return out;
     }
   } else if (!http.begin(url)) {
@@ -75,7 +82,10 @@ LinkResult ServerLink::postTelemetry(const PrinterState &printer, const BmeReadi
   putFloat(p, "bed_actual", printer.bed_actual);
   putFloat(p, "bed_target", printer.bed_target);
   putFloat(p, "nozzle_actual", printer.nozzle_actual);
+  putFloat(p, "chamber_c", printer.chamber_c);
+  putFloat(p, "chamber_target_c", printer.chamber_target_c);
   p["light_on"] = printer.light_on;
+  p["light_known"] = printer.light_known;
   p["box_fan"] = printer.box_fan;
   p["camera_url"] = camera_url;
 

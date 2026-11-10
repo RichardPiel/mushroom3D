@@ -23,6 +23,7 @@ bool last_link_ok = false;
 uint32_t vent_cycle_start_ms = 0;
 uint32_t vent_off_at_ms = 0;
 uint32_t last_vent_cmd_ms = 0;
+uint32_t last_light_ms = 0;
 
 void connectWifi() {
   WiFi.mode(WIFI_STA);
@@ -105,9 +106,23 @@ void handleCommand(JsonObjectConst cmd, JsonObject result) {
     desired.vent_on = false;
     result["ok"] = true;
   } else if (strcmp(type, "light") == 0) {
-    bool on = cmd["on"] | false;
-    if (printer.setLight(on)) {
+    bool on = false;
+    if (cmd["on"].is<bool>()) {
+      on = cmd["on"].as<bool>();
+    } else if (!cmd["on"].isNull()) {
+      on = cmd["on"].as<int>() != 0;
+    }
+    // Cmd 403 bascule la lampe : renvoyer le même état l'éteint.
+    const bool known = printer.state().light_known;
+    const bool same = known && printer.state().light_on == on;
+    const bool recent = desired.light_on == on && last_light_ms != 0 &&
+                        millis() - last_light_ms < 8000;
+    if (same || recent) {
       desired.light_on = on;
+      result["ok"] = true;
+    } else if (printer.setLight(on)) {
+      desired.light_on = on;
+      last_light_ms = millis();
       result["ok"] = true;
     } else {
       result["error"] = "light failed";

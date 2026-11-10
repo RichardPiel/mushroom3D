@@ -38,9 +38,9 @@ struct Cache {
 } cache;
 
 void backlight(uint8_t pct) {
-  ledcSetup(1, 20000, 10);
-  ledcAttachPin(PIN_BL, 1);
-  ledcWrite(1, (uint32_t)pct * 1023 / 100);
+  // API LEDC du core ESP32 3.x : le canal est choisi à partir de la broche.
+  ledcAttach(PIN_BL, 20000, 10);
+  ledcWrite(PIN_BL, (uint32_t)pct * 1023 / 100);
 }
 
 void fillCard(int16_t x, int16_t y, int16_t w, int16_t h) {

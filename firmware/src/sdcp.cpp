@@ -201,7 +201,9 @@ bool SdcpClient::setLight(bool on) {
   if (!sendCommand(kCmdParams, buf)) {
     return false;
   }
-  state_.light_on = on;
+  if (!state_.light_known) {
+    state_.light_on = on;
+  }
   return true;
 }
 
@@ -249,6 +251,18 @@ bool SdcpClient::readTemperatures() {
     }
     if (!status["TempOfNozzle"].isNull()) {
       state_.nozzle_actual = status["TempOfNozzle"].as<float>();
+    }
+    if (!status["TempOfBox"].isNull()) {
+      state_.chamber_c = status["TempOfBox"].as<float>();
+    }
+    if (!status["TempTargetBox"].isNull()) {
+      state_.chamber_target_c = status["TempTargetBox"].as<float>();
+    }
+    JsonObject light = status["LightStatus"].as<JsonObject>();
+    if (!light.isNull() && !light["SecondLight"].isNull()) {
+      JsonVariant second = light["SecondLight"];
+      state_.light_on = second.is<bool>() ? second.as<bool>() : second.as<int>() != 0;
+      state_.light_known = true;
     }
     JsonObject fans = status["CurrentFanSpeed"].as<JsonObject>();
     if (!fans.isNull() && !fans["BoxFan"].isNull()) {

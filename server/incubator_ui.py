@@ -2,7 +2,7 @@
 """
 incubator_ui.py — Interface web distante pour l'incubateur.
 
-    INCUBATOR_PASSWORD=… RELAY_TOKEN=… python3 incubator_ui.py
+    INCUBATOR_PASSWORD=os.environ.get( RELAY_TOKEN=os.environ.get( python3 incubator_ui.py
     → http://127.0.0.1:8765
 
 La carte ESP32 (salon) pousse la télémétrie et tire les ordres.
@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import mimetypes
 import os
 import secrets
@@ -55,7 +56,9 @@ METRICS_FIELDS = (
     "vent_speed_pct",
     "vent_actual_pct",
     "air_c",
+    "chamber_c",
     "humidity_pct",
+    "light_on",
     "photo",
 )
 METRICS_WINDOWS = {
@@ -63,7 +66,8 @@ METRICS_WINDOWS = {
     "60m": 60 * 60,
     "24h": 24 * 60 * 60,
 }
-METRICS_SERIES = ("bed_actual_c", "consigne_c", "air_c", "humidity_pct")
+METRICS_SERIES = ("bed_actual_c", "consigne_c", "air_c", "chamber_c", "humidity_pct")
+METRICS_FLAGS = ("vent_on", "light_on")
 
 AUTH_PASSWORD = os.environ.get("INCUBATOR_PASSWORD", "")
 RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "")
@@ -78,6 +82,9 @@ DEFAULT_PHOTO_INTERVAL_S = 1800
 DEFAULT_VENT_SPEED = 60
 DEFAULT_VENT_INTERVAL_S = 1800
 DEFAULT_VENT_ON_S = 120
+DEFAULT_SUN_LAT = 48.8566
+DEFAULT_SUN_LON = 2.3522
+SUN_UP_ELEVATION_DEG = -0.833
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,6 +157,77 @@ def _float_or_none(raw: str) -> float | None:
         return None
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _cfg_float(cfg: dict[str, Any], key: str, default: float) -> float:
+    try:
+        return float(cfg[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def _cfg_int(cfg: dict[str, Any], key: str, default: int) -> int:
+    try:
+        return int(cfg[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def _julian_day(when: datetime) -> float:
+    when = when.astimezone(timezone.utc)
+    year, month = when.year, when.month
+    day = when.day + (when.hour + (when.minute + when.second / 60) / 60) / 24
+    if month <= 2:
+        year -= 1
+        month += 12
+    century = year // 100
+    return (
+        int(365.25 * (year + 4716))
+        + int(30.6001 * (month + 1))
+        + day
+        + (2 - century + century // 4)
+        - 1524.5
+    )
+
+
+def solar_elevation_deg(latitude: float, longitude: float, when: datetime) -> float:
+    """Élévation du soleil en degrés. Positif : au-dessus de l'horizon géométrique."""
+    n = _julian_day(when) - 2451545.0
+    mean_lon = math.radians((280.460 + 0.9856474 * n) % 360)
+    anomaly = math.radians((357.528 + 0.9856003 * n) % 360)
+    ecliptic = (
+        mean_lon
+        + math.radians(1.915) * math.sin(anomaly)
+        + math.radians(0.020) * math.sin(2 * anomaly)
+    )
+    obliquity = math.radians(23.439 - 0.0000004 * n)
+    right_asc = math.atan2(math.cos(obliquity) * math.sin(ecliptic), math.cos(ecliptic))
+    declination = math.asin(math.sin(obliquity) * math.sin(ecliptic))
+    gmst = math.radians((280.46061837 + 360.98564736629 * n) % 360)
+    hour_angle = gmst + math.radians(longitude) - right_asc
+    lat = math.radians(latitude)
+    sine = (
+        math.sin(lat) * math.sin(declination)
+        + math.cos(lat) * math.cos(declination) * math.cos(hour_angle)
+    )
+    sine = max(-1.0, min(1.0, sine))
+    return math.degrees(math.asin(sine))
+
+
+def sun_is_up(latitude: float, longitude: float, when: datetime | None = None) -> tuple[bool, float]:
+    when = when or datetime.now(timezone.utc)
+    elevation = solar_elevation_deg(latitude, longitude, when)
+    return elevation >= SUN_UP_ELEVATION_DEG, elevation
+
+
 def read_metrics_window(window: str = "60m", max_points: int = 480) -> dict[str, Any]:
     """Points CSV dans la fenêtre demandée (5m / 60m / 24h), sous-échantillonnés."""
     key = (window or "60m").strip().lower()
@@ -166,13 +244,23 @@ def read_metrics_window(window: str = "60m", max_points: int = 480) -> dict[str,
                 if ts is None or ts.timestamp() < cutoff:
                     continue
                 item: dict[str, Any] = {"t": ts.strftime("%Y-%m-%dT%H:%M:%SZ")}
-                for field in METRICS_SERIES:
+                for field in (*METRICS_SERIES, *METRICS_FLAGS):
                     item[field] = _float_or_none(row.get(field, ""))
                 points.append(item)
     if len(points) > max_points and max_points > 1:
         step = len(points) / max_points
-        picked = [points[int(i * step)] for i in range(max_points - 1)]
-        picked.append(points[-1])
+        picked: list[dict[str, Any]] = []
+        for i in range(max_points - 1):
+            start = int(i * step)
+            end = max(int((i + 1) * step), start + 1)
+            item = dict(points[start])
+            chunk = points[start:end]
+            for flag in METRICS_FLAGS:
+                values = [pt[flag] for pt in chunk if pt.get(flag) is not None]
+                if values:
+                    item[flag] = 1.0 if any(value >= 0.5 for value in values) else 0.0
+            picked.append(item)
+        picked.append(dict(points[-1]))
         points = picked
     return {"window": key, "span_s": span_s, "count": len(points), "points": points}
 
@@ -236,11 +324,22 @@ class IncubatorController:
         self.printer_ip = ""
         self.last_error = ""
 
+        cfg = _load_config()
         self.target_temp = float(DEFAULT_TARGET_TEMP)
-        self.photo_interval_s = int(DEFAULT_PHOTO_INTERVAL_S)
+        self.photo_interval_s = _cfg_int(cfg, "photo_interval_s", DEFAULT_PHOTO_INTERVAL_S)
+        if not (10 <= self.photo_interval_s <= 86400):
+            self.photo_interval_s = int(DEFAULT_PHOTO_INTERVAL_S)
         self.heater_on = False
         self.incubator_running = False
         self.light_on = False
+        self.light_known = False
+        self.light_target = False
+        self.light_mode = cfg.get("light_mode") if cfg.get("light_mode") in ("manual", "sun") else "manual"
+        self.sun_lat = _cfg_float(cfg, "sun_lat", _env_float("SUN_LAT", DEFAULT_SUN_LAT))
+        self.sun_lon = _cfg_float(cfg, "sun_lon", _env_float("SUN_LON", DEFAULT_SUN_LON))
+        self.sun_elevation = 0.0
+        self._last_auto_photo = time.monotonic()
+        self._last_light_cmd = 0.0
 
         self.vent_mode = "off"
         self.vent_on = False
@@ -253,6 +352,8 @@ class IncubatorController:
         self.bed_actual: float | None = None
         self.bed_target: float | None = None
         self.nozzle_actual: float | None = None
+        self.chamber_c: float | None = None
+        self.chamber_target_c: float | None = None
         self.last_photo: str | None = None
         self.photo_count = 0
         self.started_at: float | None = None
@@ -272,6 +373,7 @@ class IncubatorController:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         self._ensure_metrics_csv()
         self._refresh_photo_count()
+        threading.Thread(target=self._scheduler, name="incubator-scheduler", daemon=True).start()
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -279,7 +381,21 @@ class IncubatorController:
 
     def _ensure_metrics_csv(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        if METRICS_CSV.is_file():
+        expected = ",".join(METRICS_FIELDS)
+        if METRICS_CSV.is_file() and METRICS_CSV.stat().st_size > 0:
+            with METRICS_CSV.open("r", encoding="utf-8", newline="") as fh:
+                header = fh.readline().strip()
+            if header == expected:
+                return
+            with METRICS_CSV.open("r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            tmp = METRICS_CSV.with_suffix(".csv.tmp")
+            with tmp.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=METRICS_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") or "" for key in METRICS_FIELDS})
+            tmp.replace(METRICS_CSV)
             return
         with METRICS_CSV.open("w", encoding="utf-8", newline="") as fh:
             csv.DictWriter(fh, fieldnames=METRICS_FIELDS).writeheader()
@@ -304,11 +420,13 @@ class IncubatorController:
                     if self.bme680.get("temperature_c") is None
                     else f"{float(self.bme680['temperature_c']):.2f}"
                 ),
+                "chamber_c": "" if self.chamber_c is None else f"{self.chamber_c:.2f}",
                 "humidity_pct": (
                     ""
                     if self.bme680.get("humidity_pct") is None
                     else f"{float(self.bme680['humidity_pct']):.1f}"
                 ),
+                "light_on": int(bool(self.light_on)),
                 "photo": photo or "",
             }
             with METRICS_CSV.open("a", encoding="utf-8", newline="") as fh:
@@ -339,11 +457,17 @@ class IncubatorController:
                 "last_error": self.last_error,
                 "target_temp": self.target_temp,
                 "photo_interval_s": self.photo_interval_s,
+                "photo_next_s": self._photo_next_s(),
                 "heater_on": self.heater_on,
                 "incubator_running": self.incubator_running,
                 "camera_on": bool(self.camera_url),
                 "camera_url": self.camera_url,
                 "light_on": self.light_on,
+                "light_mode": self.light_mode,
+                "sun_lat": self.sun_lat,
+                "sun_lon": self.sun_lon,
+                "sun_elevation": round(self.sun_elevation, 1),
+                "sun_up": self.sun_elevation >= SUN_UP_ELEVATION_DEG,
                 "vent_mode": self.vent_mode,
                 "vent_on": self.vent_on,
                 "vent_speed": self.vent_speed,
@@ -354,6 +478,8 @@ class IncubatorController:
                 "bed_actual": self.bed_actual,
                 "bed_target": self.bed_target,
                 "nozzle_actual": self.nozzle_actual,
+                "chamber_c": self.chamber_c,
+                "chamber_target_c": self.chamber_target_c,
                 "last_photo": self.last_photo,
                 "photo_count": self.photo_count,
                 "metrics_csv": "/api/metrics.csv",
@@ -397,7 +523,14 @@ class IncubatorController:
                 self.bed_target = float(printer["bed_target"])
             if printer.get("nozzle_actual") is not None:
                 self.nozzle_actual = float(printer["nozzle_actual"])
-            if "light_on" in printer:
+            if printer.get("chamber_c") is not None:
+                self.chamber_c = float(printer["chamber_c"])
+            if printer.get("chamber_target_c") is not None:
+                self.chamber_target_c = float(printer["chamber_target_c"])
+            if printer.get("light_known"):
+                self.light_known = True
+                self.light_on = bool(printer.get("light_on"))
+            elif "light_known" not in printer and "light_on" in printer:
                 self.light_on = bool(printer["light_on"])
             if printer.get("box_fan") is not None:
                 self.vent_actual = float(printer["box_fan"])
@@ -430,8 +563,6 @@ class IncubatorController:
                 self.vent_duration_s = int(desired["vent_duration_s"])
             if desired.get("vent_remaining_s") is not None:
                 self.vent_remaining_s = int(desired["vent_remaining_s"])
-            if "light_on" in desired:
-                self.light_on = bool(desired["light_on"])
 
             self._append_metrics()
             return {"ok": True}
@@ -532,14 +663,28 @@ class IncubatorController:
                 }
             )
             self.last_error = ""
+            self._append_metrics()
             return self.status()
+
+    def _assign_photo_interval(self, interval_s: int) -> str | None:
+        """Caller holds self.lock. Returns an error message, or None."""
+        try:
+            interval_s = int(interval_s)
+        except (TypeError, ValueError):
+            return "Intervalle photo invalide"
+        if not (10 <= interval_s <= 86400):
+            return "Intervalle photo hors plage 10 s – 24 h"
+        self.photo_interval_s = interval_s
+        _save_config({"photo_interval_s": interval_s})
+        return None
 
     def set_photo_interval(self, interval_s: int) -> dict[str, Any]:
         with self.lock:
-            self.photo_interval_s = max(10, int(interval_s))
+            error = self._assign_photo_interval(interval_s)
+            if error:
+                self.last_error = error
+                return self.status()
             self.last_error = ""
-            if self.incubator_running:
-                self._enqueue({"type": "incubator_start", "temp": self.target_temp})
             return self.status()
 
     def start_incubator(self, temp_c: float | None = None, interval_s: int | None = None) -> dict[str, Any]:
@@ -547,10 +692,14 @@ class IncubatorController:
             if temp_c is not None:
                 self.target_temp = float(temp_c)
             if interval_s is not None:
-                self.photo_interval_s = max(10, int(interval_s))
+                error = self._assign_photo_interval(interval_s)
+                if error:
+                    self.last_error = error
+                    return self.status()
             self.heater_on = True
             self.incubator_running = True
             self.started_at = time.time()
+            self._last_auto_photo = time.monotonic() - self.photo_interval_s
             self._enqueue({"type": "incubator_start", "temp": self.target_temp})
             self.last_error = ""
             return self.status()
@@ -563,12 +712,126 @@ class IncubatorController:
             self._enqueue({"type": "incubator_stop", "turn_off_heat": bool(turn_off_heat)})
             return self.status()
 
-    def set_light(self, on: bool) -> dict[str, Any]:
+    def _photo_next_s(self) -> int | None:
+        """Caller holds self.lock."""
+        if not self.incubator_running:
+            return None
+        remain = self.photo_interval_s - (time.monotonic() - self._last_auto_photo)
+        return max(0, int(remain))
+
+    def _assign_sun_place(self, lat: float, lon: float) -> str | None:
+        """Caller holds self.lock."""
+        try:
+            lat = float(lat)
+            lon = float(lon)
+        except (TypeError, ValueError):
+            return "Latitude ou longitude invalide"
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return "Latitude hors −90…90 ou longitude hors −180…180"
+        self.sun_lat = lat
+        self.sun_lon = lon
+        _save_config({"sun_lat": lat, "sun_lon": lon})
+        up, elevation = sun_is_up(lat, lon)
+        self.sun_elevation = elevation
+        return None
+
+    def _queue_light(self, on: bool) -> None:
+        """Enqueue a light order unless the same one is already waiting. Caller holds self.lock."""
+        on = bool(on)
+        kept = deque(
+            cmd for cmd in self.commands if cmd.get("type") != "light" or bool(cmd.get("on")) == on
+        )
+        self.commands = kept
+        if any(cmd.get("type") == "light" for cmd in self.commands):
+            return
+        self._last_light_cmd = time.monotonic()
+        self._enqueue({"type": "light", "on": on})
+
+    def _ensure_light(self, on: bool, *, force: bool = False) -> None:
+        """Hold the lamp on the target. Caller holds self.lock.
+
+        Cmd 403 toggles the chamber lamp, so a periodic refresh turns it off.
+        Send only when the target changes or the printer reports the other state.
+        """
+        on = bool(on)
+        changed = on != self.light_target
+        self.light_target = on
+        if self.light_known and self.light_on == on:
+            return
+        pending_same = any(
+            cmd.get("type") == "light" and bool(cmd.get("on")) == on for cmd in self.commands
+        )
+        if pending_same and not force:
+            return
+        elapsed = time.monotonic() - self._last_light_cmd
+        if force or changed or elapsed >= 12:
+            self._queue_light(on)
+
+    def set_light(
+        self,
+        on: bool | None = None,
+        *,
+        mode: str | None = None,
+        lat: float | None = None,
+        lon: float | None = None,
+    ) -> dict[str, Any]:
         with self.lock:
-            self.light_on = bool(on)
-            self._enqueue({"type": "light", "on": bool(on)})
+            if lat is not None or lon is not None:
+                error = self._assign_sun_place(
+                    self.sun_lat if lat is None else lat,
+                    self.sun_lon if lon is None else lon,
+                )
+                if error:
+                    self.last_error = error
+                    return self.status()
+            if mode in ("manual", "sun"):
+                self.light_mode = mode
+                _save_config({"light_mode": mode})
+            elif mode is not None:
+                self.last_error = "Mode lumière inconnu"
+                return self.status()
+            if on is None and self.light_mode == "sun":
+                up, elevation = sun_is_up(self.sun_lat, self.sun_lon)
+                self.sun_elevation = elevation
+                on = up
+            if on is None:
+                self.last_error = ""
+                return self.status()
+            if self.light_mode != "sun":
+                self.light_on = bool(on)
+            self._ensure_light(bool(on), force=True)
             self.last_error = ""
             return self.status()
+
+    def _scheduler(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._tick_sun()
+                self._tick_photos()
+            except Exception:
+                log.exception("Scheduler")
+            self._stop.wait(1.0)
+
+    def _tick_sun(self) -> None:
+        up, elevation = sun_is_up(self.sun_lat, self.sun_lon)
+        with self.lock:
+            self.sun_elevation = elevation
+            if self.light_mode != "sun":
+                return
+            self._ensure_light(up)
+
+    def _tick_photos(self) -> None:
+        with self.lock:
+            if not self.incubator_running:
+                return
+            if time.monotonic() - self._last_auto_photo < self.photo_interval_s:
+                return
+            self._last_auto_photo = time.monotonic()
+        result = self.take_snapshot()
+        if not result.get("ok"):
+            with self.lock:
+                retry = min(30, self.photo_interval_s)
+                self._last_auto_photo = time.monotonic() - self.photo_interval_s + retry
 
     def camera_enable(self) -> dict[str, Any]:
         # Activation locale côté carte via SDCP ; le preview passe par camera_url.
@@ -673,15 +936,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     --danger: #ff6b5a;
     --ok: #3ddc97;
     --warn: #e6b35a;
-    --info: #6ec8ff;
     --radius: 16px;
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0;
-    min-height: 100vh;
-    font-family: Outfit, system-ui, sans-serif;
-    color: var(--text);
+    margin: 0; min-height: 100vh;
+    font-family: Outfit, system-ui, sans-serif; color: var(--text);
     background:
       radial-gradient(1000px 480px at 8% -12%, rgba(61,220,151,.10), transparent 55%),
       radial-gradient(800px 420px at 100% 0%, rgba(110,200,255,.06), transparent 50%),
@@ -706,10 +966,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .dot.bad { background: var(--danger); }
 
   .kpi {
-    display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 14px;
+    display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; margin-bottom: 14px;
   }
-  @media (max-width: 1100px) { .kpi { grid-template-columns: repeat(3, 1fr); } }
-  @media (max-width: 620px) { .kpi { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 1100px) { .kpi { grid-template-columns: repeat(4, 1fr); } }
+  @media (max-width: 700px) { .kpi { grid-template-columns: repeat(2, 1fr); } }
   .kpi-card {
     background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
     padding: 12px 14px; min-height: 78px;
@@ -718,12 +978,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--muted); font-size: .7rem; letter-spacing: .06em; text-transform: uppercase;
   }
   .kpi-card .value {
-    margin-top: 4px; font-size: 1.55rem; font-weight: 650; letter-spacing: -.03em;
+    margin-top: 4px; font-size: 1.45rem; font-weight: 650; letter-spacing: -.03em;
   }
   .kpi-card .value small { font-size: .75rem; color: var(--muted); font-weight: 460; }
 
   .dash {
-    display: grid; grid-template-columns: 1.25fr .95fr; gap: 14px; align-items: start;
+    display: grid; grid-template-columns: 1.2fr 1fr; gap: 14px; align-items: start;
   }
   @media (max-width: 980px) { .dash { grid-template-columns: 1fr; } }
 
@@ -743,34 +1003,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   .cam-frame { position: relative; background: #050709; aspect-ratio: 16/10; }
   .cam-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .cam-meta {
-    position: absolute; left: 12px; bottom: 12px;
-    padding: 5px 10px; border-radius: 999px;
-    background: rgba(7,10,13,.75); border: 1px solid var(--line);
-    font-size: .75rem; backdrop-filter: blur(8px);
-  }
   .cam-actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
 
   .set-list { display: grid; gap: 10px; }
-  .set-row {
-    display: grid; grid-template-columns: 1fr; gap: 8px;
-    padding: 12px; border-radius: 14px; background: var(--panel-2); border: 1px solid var(--line);
+  .set-row, .mode-block {
+    display: grid; gap: 8px; padding: 12px; border-radius: 14px;
+    background: var(--panel-2); border: 1px solid var(--line);
   }
-  .set-row .head {
+  .set-row .head, .mode-block .head {
     display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
   }
-  .set-row .head .name { font-weight: 560; font-size: .92rem; }
-  .set-row .head .unit { color: var(--muted); font-size: .78rem; }
-  .set-ctrl {
-    display: grid; grid-template-columns: 1fr; gap: 8px;
-  }
-  .set-ctrl input[type=number], .set-ctrl input[type=url], .set-ctrl input[type=text] {
+  .set-row .name, .mode-block .name { font-weight: 560; font-size: .92rem; }
+  .set-row .unit, .mode-block .state { color: var(--muted); font-size: .78rem; }
+  .mode-block .state { text-align: right; }
+  .set-ctrl { display: grid; gap: 8px; }
+  .set-ctrl input {
     width: 100%; padding: 11px 12px; border-radius: 12px;
     border: 1px solid var(--line); background: #0b1015; color: var(--text); font: inherit;
   }
   .set-ctrl input:focus { outline: 2px solid rgba(61,220,151,.4); border-color: transparent; }
-  .trio { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 8px; }
-  .trio-modes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  .trio, .trio-modes { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 8px; }
+  .trio-modes { grid-template-columns: 1fr 1fr 1fr; }
+  .modes { display: grid; gap: 10px; margin-top: 12px; }
 
   button {
     font: inherit; font-weight: 560; border: 0; border-radius: 12px;
@@ -780,15 +1034,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .btn-gold, .btn-primary { background: var(--accent); color: var(--accent-ink); }
   .btn-ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
   .btn-danger { background: rgba(255,107,90,.16); color: #ffd0ca; border: 1px solid rgba(255,107,90,.25); }
-  .btn-ghost[aria-pressed="true"], .trio-modes .btn-gold { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
-
-  .modes { display: grid; gap: 10px; margin-top: 4px; }
-  .mode-block {
-    padding: 12px; border-radius: 14px; background: var(--panel-2); border: 1px solid var(--line);
-  }
-  .mode-block .head { margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; }
-  .mode-block .name { font-weight: 560; font-size: .92rem; }
-  .mode-block .state { color: var(--muted); font-size: .78rem; text-align: right; }
+  .seg { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
 
   .hint { color: var(--muted); font-size: .8rem; margin: 10px 0 0; line-height: 1.45; }
   .err {
@@ -798,11 +1045,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .err.show { display: block; }
 
   .below { display: grid; gap: 14px; margin-top: 14px; }
-  .seg { display: inline-flex; flex-wrap: wrap; gap: 6px; }
-  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
   .chart-wrap {
-    position: relative; width: 100%; height: 280px; margin-top: 10px;
+    position: relative; width: 100%; height: 320px; margin-top: 10px;
     border-radius: 12px; background: rgba(255,255,255,.03); border: 1px solid var(--line);
   }
   .chart-wrap canvas { width: 100%; height: 100%; display: block; }
@@ -838,6 +1083,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <section class="kpi" aria-label="Mesures">
       <div class="kpi-card"><div class="label">Plateau</div><div class="value" id="bedActual">—<small> °C</small></div></div>
       <div class="kpi-card"><div class="label">Consigne</div><div class="value" id="bedTarget">—<small> °C</small></div></div>
+      <div class="kpi-card"><div class="label">Chambre</div><div class="value" id="chamberTemp">—<small> °C</small></div></div>
       <div class="kpi-card"><div class="label">Air BME</div><div class="value" id="bmeTemp">—<small> °C</small></div></div>
       <div class="kpi-card"><div class="label">Humidité</div><div class="value" id="bmeHum">—<small> %</small></div></div>
       <div class="kpi-card"><div class="label">Air box</div><div class="value" id="ventActual">—<small> %</small></div></div>
@@ -856,6 +1102,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <button type="button" class="btn-ghost" id="btnSnap">Photo</button>
             <button type="button" class="btn-ghost" id="btnRefresh">Rafraîchir</button>
           </div>
+          <p class="hint" id="sunState" style="margin-top:10px">—</p>
         </div>
       </section>
 
@@ -878,7 +1125,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <div class="set-row">
               <div class="head"><span class="name">Intervalle photo</span><span class="unit">secondes</span></div>
               <div class="set-ctrl">
-                <input id="interval" type="number" min="10" step="10" value="1800" />
+                <input id="interval" type="number" min="10" max="86400" step="10" value="1800" />
                 <div class="trio">
                   <button type="button" class="btn-ghost btn-step" data-target="interval" data-delta="-10">−</button>
                   <button type="button" class="btn-gold" id="btnSetInterval">Appliquer</button>
@@ -924,6 +1171,30 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
 
             <div class="set-row">
+              <div class="head"><span class="name">Latitude soleil</span><span class="unit">°</span></div>
+              <div class="set-ctrl">
+                <input id="sunLat" type="number" min="-90" max="90" step="0.01" value="48.86" />
+                <div class="trio">
+                  <button type="button" class="btn-ghost btn-step" data-target="sunLat" data-delta="-0.1">−</button>
+                  <button type="button" class="btn-gold" id="btnSetSun">Appliquer</button>
+                  <button type="button" class="btn-ghost btn-step" data-target="sunLat" data-delta="0.1">+</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-row">
+              <div class="head"><span class="name">Longitude soleil</span><span class="unit">°</span></div>
+              <div class="set-ctrl">
+                <input id="sunLon" type="number" min="-180" max="180" step="0.01" value="2.35" />
+                <div class="trio">
+                  <button type="button" class="btn-ghost btn-step" data-target="sunLon" data-delta="-0.1">−</button>
+                  <button type="button" class="btn-gold" id="btnSetSunLon">Appliquer</button>
+                  <button type="button" class="btn-ghost btn-step" data-target="sunLon" data-delta="0.1">+</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="set-row">
               <div class="head"><span class="name">URL caméra</span><span class="unit">MJPEG</span></div>
               <div class="set-ctrl">
                 <input id="cameraUrl" type="url" placeholder="http://192.168.1.20:3031/video" autocomplete="off" spellcheck="false" />
@@ -936,7 +1207,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
           </div>
 
-          <div class="modes" style="margin-top:12px">
+          <div class="modes">
             <div class="mode-block">
               <div class="head">
                 <span class="name">Incubateur</span>
@@ -957,6 +1228,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <button type="button" class="btn-ghost" id="btnVentManual">Manuel</button>
                 <button type="button" class="btn-ghost" id="btnVentCycle">Cycle</button>
                 <button type="button" class="btn-ghost" id="btnVentOff">Stop</button>
+              </div>
+            </div>
+            <div class="mode-block">
+              <div class="head">
+                <span class="name">Flash</span>
+                <span class="state" id="lightModeState">Manuel</span>
+              </div>
+              <div class="trio-modes" id="lightMode">
+                <button type="button" class="btn-ghost" data-mode="manual" aria-pressed="true">Manuel</button>
+                <button type="button" class="btn-ghost" data-mode="sun">Soleil</button>
+                <button type="button" class="btn-ghost" id="btnLightModeApply">Appliquer lieu</button>
               </div>
             </div>
           </div>
@@ -981,12 +1263,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
             <button type="button" class="btn-ghost" id="btnMetrics">Télécharger CSV</button>
           </div>
-          <div class="chart-wrap"><canvas id="metricsChart" width="1100" height="280"></canvas></div>
+          <div class="chart-wrap"><canvas id="metricsChart" width="1100" height="320"></canvas></div>
           <div class="chart-legend">
             <span><i class="swatch" style="background:#3ddc97"></i>Plateau</span>
             <span><i class="swatch" style="background:#e6b35a"></i>Consigne</span>
             <span><i class="swatch" style="background:#6ec8ff"></i>Air BME</span>
+            <span><i class="swatch" style="background:#ff8f6b"></i>Chambre</span>
             <span><i class="swatch" style="background:#c9a0ff"></i>Humidité %</span>
+            <span><i class="swatch" style="background:#5ee0c2"></i>Ventilation</span>
+            <span><i class="swatch" style="background:#ffd07a"></i>Flash</span>
           </div>
         </div>
       </section>
@@ -1006,7 +1291,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 const $ = (id) => document.getElementById(id);
 const DEFAULT_CAMERA_URL = "http://192.168.1.20:3031/video";
 let ventMode = "off";
-let incubatorRunning = false;
+let lightMode = "manual";
 
 async function api(path, opts) {
   const r = await fetch(path, {
@@ -1046,7 +1331,7 @@ function clampInput(id) {
   const max = el.max !== "" ? Number(el.max) : Infinity;
   const step = el.step !== "" ? Number(el.step) : 1;
   let v = Number(el.value);
-  if (!Number.isFinite(v)) v = min;
+  if (!Number.isFinite(v)) v = Number.isFinite(min) ? min : 0;
   v = Math.min(max, Math.max(min, v));
   if (Number.isFinite(step) && step > 0) {
     const precision = String(step).includes(".") ? String(step).split(".")[1].length : 0;
@@ -1063,10 +1348,14 @@ function showErr(msg) {
   err.classList.add("show");
 }
 
+function sunPlace() {
+  return { lat: clampInput("sunLat"), lon: clampInput("sunLon") };
+}
+
 function applyStatus(s) {
   const linkOnline = !!(s.link && s.link.online);
-  incubatorRunning = !!s.incubator_running;
   ventMode = s.vent_mode || "off";
+  lightMode = s.light_mode || "manual";
 
   $("identity").textContent = `${s.machine_name} · FW ${s.firmware} · ${s.printer_ip || "—"}`;
   $("dot").className = "dot " + (s.connected ? "ok" : "bad");
@@ -1080,6 +1369,7 @@ function applyStatus(s) {
 
   $("bedActual").innerHTML = (s.bed_actual ?? "—") + "<small> °C</small>";
   $("bedTarget").innerHTML = (s.target_temp ?? "—") + "<small> °C</small>";
+  $("chamberTemp").innerHTML = fmtNum(s.chamber_c) + "<small> °C</small>";
   $("photoCount").textContent = s.photo_count ?? 0;
   $("ventActual").innerHTML = (s.vent_actual != null ? Math.round(s.vent_actual) : "—") + "<small> %</small>";
 
@@ -1093,6 +1383,8 @@ function applyStatus(s) {
   setIfIdle("ventInterval", s.vent_interval_s);
   setIfIdle("ventDuration", s.vent_duration_s);
   setIfIdle("cameraUrl", s.camera_url);
+  setIfIdle("sunLat", s.sun_lat);
+  setIfIdle("sunLon", s.sun_lon);
   $("camMeta").textContent = s.camera_url ? "Flux configuré" : "Pas d'URL";
   $("btnLogout").hidden = !s.auth;
 
@@ -1100,13 +1392,25 @@ function applyStatus(s) {
   else showErr("");
 
   $("runState").textContent = s.incubator_running
-    ? `ON · ${s.last_photo || "—"}`
+    ? `ON · photo / ${s.photo_interval_s} s · prochaine ${fmtRemain(s.photo_next_s)}`
     : (s.heater_on ? "Chauffe manuelle" : "Veille");
 
   const lightBtn = $("btnLight");
   lightBtn.textContent = s.light_on ? "Flash off" : "Flash";
   lightBtn.className = s.light_on ? "btn-ghost" : "btn-gold";
   lightBtn.dataset.on = s.light_on ? "1" : "0";
+
+  for (const btn of $("lightMode").querySelectorAll("button[data-mode]")) {
+    btn.className = btn.dataset.mode === lightMode ? "btn-gold" : "btn-ghost";
+    btn.setAttribute("aria-pressed", btn.dataset.mode === lightMode ? "true" : "false");
+  }
+  $("lightModeState").textContent = lightMode === "sun" ? "Soleil" : "Manuel";
+
+  const sunEl = Number(s.sun_elevation);
+  const lamp = s.light_on ? "ON" : "OFF";
+  $("sunState").textContent = Number.isFinite(sunEl)
+    ? `${s.sun_up ? "Jour" : "Nuit"} · soleil ${sunEl.toFixed(0)}° · flash ${lamp}`
+    : "—";
 
   $("btnVentManual").className = s.vent_mode === "manual" ? "btn-gold" : "btn-ghost";
   $("btnVentCycle").className = s.vent_mode === "cycle" ? "btn-gold" : "btn-ghost";
@@ -1125,11 +1429,8 @@ function applyStatus(s) {
 }
 
 async function refreshStatus() {
-  try {
-    applyStatus(await api("/api/status"));
-  } catch (e) {
-    showErr(String(e.message || e));
-  }
+  try { applyStatus(await api("/api/status")); }
+  catch (e) { showErr(String(e.message || e)); }
 }
 
 async function refreshGallery() {
@@ -1147,11 +1448,8 @@ $("btnMetrics").onclick = async () => {
   const blob = await r.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url;
-  a.download = "metrics.csv";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  a.href = url; a.download = "metrics.csv";
+  document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url);
 };
 
@@ -1160,7 +1458,12 @@ const SERIES = [
   { key: "bed_actual_c", color: "#3ddc97", axis: "temp" },
   { key: "consigne_c", color: "#e6b35a", axis: "temp" },
   { key: "air_c", color: "#6ec8ff", axis: "temp" },
+  { key: "chamber_c", color: "#ff8f6b", axis: "temp" },
   { key: "humidity_pct", color: "#c9a0ff", axis: "hum" },
+];
+const LANES = [
+  { key: "vent_on", color: "rgba(94, 224, 194, .9)", label: "Vent" },
+  { key: "light_on", color: "rgba(255, 208, 122, .95)", label: "Flash" },
 ];
 
 function niceRange(min, max, pad = 0.08) {
@@ -1175,15 +1478,18 @@ function drawMetricsChart(points) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth || 1100;
-  const cssH = canvas.clientHeight || 280;
+  const cssH = canvas.clientHeight || 320;
   canvas.width = Math.round(cssW * dpr);
   canvas.height = Math.round(cssH * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cssW, cssH);
 
-  const pad = { l: 44, r: 44, t: 16, b: 28 };
+  const laneH = 12;
+  const laneGap = 4;
+  const pad = { l: 48, r: 44, t: 16, b: 22 + LANES.length * (laneH + laneGap) };
   const w = cssW - pad.l - pad.r;
   const h = cssH - pad.t - pad.b;
+
   ctx.fillStyle = "rgba(255,255,255,.03)";
   ctx.fillRect(0, 0, cssW, cssH);
 
@@ -1220,9 +1526,10 @@ function drawMetricsChart(points) {
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + w, y); ctx.stroke();
     const tv = tR.max - (i / 4) * (tR.max - tR.min);
     const hv = hR.max - (i / 4) * (hR.max - hR.min);
-    ctx.fillText(tv.toFixed(1), pad.l - 8, y + 3);
+    const labelY = i === 4 ? y - 3 : y + 3;
+    ctx.fillText(tv.toFixed(1), pad.l - 8, labelY);
     ctx.textAlign = "left";
-    ctx.fillText(hv.toFixed(0) + "%", pad.l + w + 8, y + 3);
+    ctx.fillText(hv.toFixed(0) + "%", pad.l + w + 8, labelY);
     ctx.textAlign = "right";
   }
 
@@ -1233,7 +1540,10 @@ function drawMetricsChart(points) {
     const label = chartWindow === "24h"
       ? t.toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })
       : t.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: chartWindow === "5m" ? "2-digit" : undefined });
-    ctx.fillText(label, xAt(i), cssH - 8);
+    if (points.length > 1 && i === 0) ctx.textAlign = "left";
+    else if (points.length > 1 && i === points.length - 1) ctx.textAlign = "right";
+    else ctx.textAlign = "center";
+    ctx.fillText(label, xAt(i), pad.t + h + 13);
   }
 
   for (const s of SERIES) {
@@ -1253,6 +1563,32 @@ function drawMetricsChart(points) {
     ctx.stroke();
     ctx.setLineDash([]);
   }
+
+  LANES.forEach((lane, row) => {
+    const y = pad.t + h + 20 + row * (laneH + laneGap);
+    ctx.fillStyle = "rgba(255,255,255,.05)";
+    ctx.fillRect(pad.l, y, w, laneH);
+    ctx.fillStyle = lane.color;
+    let start = null;
+    const flush = (endIdx) => {
+      if (start == null) return;
+      const x1 = xAt(start);
+      const x2 = xAt(endIdx);
+      ctx.fillRect(x1, y, Math.max(3, x2 - x1), laneH);
+      start = null;
+    };
+    for (let i = 0; i < points.length; i++) {
+      const v = points[i][lane.key];
+      const on = v != null && v >= 0.5;
+      if (on && start == null) start = i;
+      if (!on && start != null) flush(i - 1);
+    }
+    if (start != null) flush(points.length - 1);
+    ctx.fillStyle = "#8b9691";
+    ctx.textAlign = "right";
+    ctx.font = "10px Outfit, system-ui, sans-serif";
+    ctx.fillText(lane.label, pad.l - 6, y + laneH - 2);
+  });
 }
 
 async function refreshChart() {
@@ -1300,12 +1636,19 @@ async function applyVentParams() {
   await applyVent(ventMode || "off");
 }
 
+async function applySunPlace(extra = {}) {
+  await api("/api/light", {
+    method: "POST",
+    body: JSON.stringify({ mode: lightMode || "manual", ...sunPlace(), ...extra }),
+  });
+  refreshStatus();
+}
+
 document.querySelectorAll(".btn-step").forEach((btn) => {
   btn.onclick = () => {
     const id = btn.dataset.target;
     const el = $(id);
-    const delta = Number(btn.dataset.delta);
-    el.value = Number(el.value || 0) + delta;
+    el.value = Number(el.value || 0) + Number(btn.dataset.delta);
     clampInput(id);
   };
 });
@@ -1315,7 +1658,7 @@ $("btnSetTemp").onclick = async () => {
   refreshStatus();
 };
 $("btnSetInterval").onclick = async () => {
-  await api("/api/incubator/interval", {
+  await api("/api/photo_interval", {
     method: "POST",
     body: JSON.stringify({ interval_s: clampInput("interval") }),
   });
@@ -1324,6 +1667,8 @@ $("btnSetInterval").onclick = async () => {
 $("btnSetVentSpeed").onclick = () => applyVentParams();
 $("btnSetVentInterval").onclick = () => applyVentParams();
 $("btnSetVentDuration").onclick = () => applyVentParams();
+$("btnSetSun").onclick = () => applySunPlace();
+$("btnSetSunLon").onclick = () => applySunPlace();
 
 $("btnStart").onclick = async () => {
   await api("/api/incubator/start", {
@@ -1346,9 +1691,22 @@ $("btnVentOff").onclick = () => applyVent("off");
 
 $("btnLight").onclick = async () => {
   const next = $("btnLight").dataset.on !== "1";
-  await api("/api/light", { method: "POST", body: JSON.stringify({ on: next }) });
+  await api("/api/light", {
+    method: "POST",
+    body: JSON.stringify({ on: next, mode: "manual", ...sunPlace() }),
+  });
   bumpCam(); refreshStatus();
 };
+$("lightMode").onclick = async (ev) => {
+  const btn = ev.target.closest("button[data-mode]");
+  if (!btn) return;
+  const body = { mode: btn.dataset.mode, ...sunPlace() };
+  if (body.mode === "manual") body.on = $("btnLight").dataset.on === "1";
+  await api("/api/light", { method: "POST", body: JSON.stringify(body) });
+  refreshStatus();
+};
+$("btnLightModeApply").onclick = () => applySunPlace();
+
 $("btnSnap").onclick = async () => {
   const r = await api("/api/snapshot", { method: "POST", body: "{}" });
   if (!r.ok) showErr(r.error || "Échec");
@@ -1678,8 +2036,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, CTRL.camera_enable())
             if path == "/api/camera/off":
                 return self._json(200, CTRL.camera_disable())
+            if path == "/api/photo_interval":
+                if "interval_s" not in body:
+                    return self._json(400, {"error": "interval_s requis"})
+                return self._json(200, CTRL.set_photo_interval(body.get("interval_s")))
             if path == "/api/light":
-                return self._json(200, CTRL.set_light(bool(body.get("on", True))))
+                mode = body.get("mode")
+                return self._json(
+                    200,
+                    CTRL.set_light(
+                        body.get("on") if "on" in body else None,
+                        mode=None if mode is None else str(mode),
+                        lat=body.get("lat") if "lat" in body else None,
+                        lon=body.get("lon") if "lon" in body else None,
+                    ),
+                )
             if path == "/api/vent":
                 return self._json(
                     200,
