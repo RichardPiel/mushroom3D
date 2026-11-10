@@ -2058,7 +2058,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <button type="button" class="btn-ghost" id="btnStopKeep">Pause</button>
                 <button type="button" class="btn-danger" id="btnOff">Éteindre</button>
               </div>
-              <p class="hint">La plage min–max est la consigne du BME. Le plateau vise le milieu, avec le double d'écart pour son inertie. Sous le minimum, il chauffe tout de suite. Vers le maximum, il baisse avant de l'atteindre. Au-delà, la ventilation reste allumée. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
               <button type="button" class="btn-ghost" id="btnHeatAuto" hidden>Reprendre la plage</button>
             </div>
           </div>
