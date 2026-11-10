@@ -1988,7 +1988,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <div class="dash">
       <section class="panel">
-        <div class="panel-h"><h2>Live</h2><span class="hint" id="camMeta" style="margin:0">Flux</span></div>
         <div class="cam-frame">
           <img id="cam" alt="Caméra incubateur" src="/api/camera.jpg" />
         </div>
@@ -2285,7 +2284,6 @@ function applyStatus(s) {
   setIfIdle("cfgTempMax", s.culture_temp_max);
   setIfIdle("cfgHumMin", s.culture_hum_min);
   setIfIdle("cfgHumMax", s.culture_hum_max);
-  $("camMeta").textContent = s.camera_url ? "Flux configuré" : "Pas d'URL";
   $("btnLogout").hidden = !s.auth;
 
   if (s.last_error) showErr(s.last_error);
