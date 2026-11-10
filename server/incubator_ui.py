@@ -49,6 +49,8 @@ METRICS_FIELDS = (
     "bed_actual_c",
     "bed_target_c",
     "consigne_c",
+    "culture_min_c",
+    "culture_max_c",
     "heater_on",
     "incubator_running",
     "vent_mode",
@@ -66,7 +68,7 @@ METRICS_WINDOWS = {
     "60m": 60 * 60,
     "24h": 24 * 60 * 60,
 }
-METRICS_SERIES = ("bed_actual_c", "consigne_c", "air_c", "chamber_c", "humidity_pct")
+METRICS_SERIES = ("bed_actual_c", "culture_min_c", "culture_max_c", "air_c", "chamber_c", "humidity_pct")
 METRICS_FLAGS = ("vent_on", "light_on")
 
 AUTH_PASSWORD = os.environ.get("INCUBATOR_PASSWORD", "")
@@ -98,8 +100,6 @@ AIR_SANE_MAX = 70.0
 BED_AUTO_MIN = 0.0
 BED_AUTO_MAX = 60.0
 BED_SLEW_C = 2.0
-COOL_ON_C = 0.5
-COOL_OFF_C = 0.1
 HEAT_I_MAX = 12.0 / AIR_KI
 HEAT_I_MIN = -15.0 / AIR_KI
 
@@ -242,7 +242,7 @@ def solar_elevation_deg(latitude: float, longitude: float, when: datetime) -> fl
 def air_bed_command(
     target_c: float, air_c: float, integral: float, dt_s: float
 ) -> tuple[float, float]:
-    """Consigne plateau pour amener le BME sur target_c.
+    """Consigne plateau pour ramener le BME sur un bord de la plage.
 
     Retourne (plateau_°C, intégrale). Le plateau automatique reste dans
     BED_AUTO_MIN…BED_AUTO_MAX ; un forçage manuel peut dépasser ce plafond.
@@ -465,7 +465,9 @@ class IncubatorController:
                 "ts_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "bed_actual_c": "" if self.bed_actual is None else f"{self.bed_actual:.2f}",
                 "bed_target_c": "" if self.bed_target is None else f"{self.bed_target:.2f}",
-                "consigne_c": f"{self.target_temp:.2f}",
+                "consigne_c": "",
+                "culture_min_c": f"{self.culture_temp_min:.2f}",
+                "culture_max_c": f"{self.culture_temp_max:.2f}",
                 "heater_on": int(bool(self.heater_on)),
                 "incubator_running": int(bool(self.incubator_running)),
                 "vent_mode": self.vent_mode,
@@ -625,6 +627,10 @@ class IncubatorController:
                     self.last_error = error
                     return self.status()
             self.last_error = ""
+            if self.incubator_running and (
+                "culture_temp_min" in body or "culture_temp_max" in body
+            ):
+                self._control_bed()
             return self.status()
 
     def set_camera_url(self, raw: str) -> dict[str, Any]:
@@ -780,16 +786,27 @@ class IncubatorController:
             return None
         return temp
 
+    def _band_edge(self, air: float) -> float | None:
+        """Bord de plage à rejoindre, ou None si le BME est déjà dedans."""
+        if air < self.culture_temp_min:
+            return self.culture_temp_min
+        if air > self.culture_temp_max:
+            return self.culture_temp_max
+        return None
+
     def _auto_bed_now(self) -> float:
         """Caller holds self.lock. Consigne plateau immédiate, sans avancer l'intégrale."""
         air = self._air_c()
         if air is None:
-            return round(max(BED_AUTO_MIN, min(BED_AUTO_MAX, self.target_temp)), 1)
-        bed, _integral = air_bed_command(self.target_temp, air, self._heat_i, 0.0)
+            return 0.0
+        edge = self._band_edge(air)
+        if edge is None or air > self.culture_temp_max:
+            return 0.0
+        bed, _integral = air_bed_command(edge, air, self._heat_i, 0.0)
         return bed
 
     def _control_bed(self) -> None:
-        """Caller holds self.lock. Ajuste le plateau d'après le BME."""
+        """Caller holds self.lock. Maintient le BME dans la plage min–max."""
         if not self.incubator_running:
             self._cool_vent = False
             return
@@ -806,13 +823,19 @@ class IncubatorController:
         self._sync_cool_vent(air)
         if self.heat_forced:
             return
+        edge = self._band_edge(air)
+        if edge is None:
+            self._heat_i = 0.0
+            return
         now = time.monotonic()
         if self._heat_tick_at <= 0:
             dt = 5.0
         else:
             dt = min(30.0, max(0.5, now - self._heat_tick_at))
         self._heat_tick_at = now
-        bed, self._heat_i = air_bed_command(self.target_temp, air, self._heat_i, dt)
+        bed, self._heat_i = air_bed_command(edge, air, self._heat_i, dt)
+        if air > self.culture_temp_max and self._bed_command is not None:
+            bed = min(bed, self._bed_command)
         if self._bed_command is not None:
             bed = min(self._bed_command + BED_SLEW_C, max(self._bed_command - BED_SLEW_C, bed))
             bed = round(bed, 1)
@@ -821,10 +844,11 @@ class IncubatorController:
         self.heater_on = bed > 0
         self._queue_bed(bed)
         log.info(
-            "Plateau %.1f °C (BME %.1f °C, consigne %.1f °C)",
+            "Plateau %.1f °C (BME %.1f °C, plage %.1f–%.1f °C)",
             bed,
             air,
-            self.target_temp,
+            self.culture_temp_min,
+            self.culture_temp_max,
         )
 
     def _queue_vent(self, mode: str) -> None:
@@ -847,25 +871,25 @@ class IncubatorController:
         self._enqueue(payload)
 
     def _sync_cool_vent(self, air: float) -> None:
-        """Ventilation continue tant que le BME est au-dessus de la consigne."""
+        """Ventilation continue tant que le BME est au-dessus du max de la plage."""
         if self.vent_mode != "cycle":
             self._cool_vent = False
             return
         if self._cool_vent:
-            if air > self.target_temp + COOL_OFF_C:
+            if air > self.culture_temp_max:
                 return
             self._cool_vent = False
             self._queue_vent("cycle")
             log.info("Refroidissement terminé, cycle d'air repris (BME %.1f °C)", air)
             return
-        if air <= self.target_temp + COOL_ON_C:
+        if air <= self.culture_temp_max:
             return
         self._cool_vent = True
         self._queue_vent("manual")
         log.info(
-            "Ventilation continue pour refroidir (BME %.1f °C, consigne %.1f °C)",
+            "Ventilation continue pour refroidir (BME %.1f °C, max %.1f °C)",
             air,
-            self.target_temp,
+            self.culture_temp_max,
         )
 
     def _parse_temp(self, temp_c: float) -> float | None:
@@ -876,21 +900,6 @@ class IncubatorController:
         if not (0 <= temp_c <= 110):
             return None
         return temp_c
-
-    def set_air_target(self, temp_c: float) -> dict[str, Any]:
-        """Consigne du BME. Le plateau n'est pas forcé."""
-        with self.lock:
-            parsed = self._parse_temp(temp_c)
-            if parsed is None:
-                self.last_error = "Température hors plage 0–110 °C"
-                return self.status()
-            self.target_temp = parsed
-            self._target_saved = True
-            self._persist_setpoints()
-            self.last_error = ""
-            if self.incubator_running and not self.heat_forced and self._air_c() is not None:
-                self._control_bed()
-            return self.status()
 
     def force_bed(self, temp_c: float) -> dict[str, Any]:
         """Impose le plateau, incubateur allumé ou non."""
@@ -909,7 +918,7 @@ class IncubatorController:
             return self.status()
 
     def release_heat_force(self) -> dict[str, Any]:
-        """Rend la main au BME si l'incubateur tourne."""
+        """Rend la main à la plage si l'incubateur tourne."""
         with self.lock:
             self.heat_forced = False
             self._heat_i = 0.0
@@ -920,7 +929,10 @@ class IncubatorController:
                 bed = self._auto_bed_now()
                 self.heater_on = bed > 0
                 self._queue_bed(bed)
-                log.info("Pilotage BME repris, plateau %.1f °C", bed)
+                air = self._air_c()
+                if air is not None:
+                    self._sync_cool_vent(air)
+                log.info("Pilotage plage repris, plateau %.1f °C", bed)
             return self.status()
 
     def heater_off(self) -> dict[str, Any]:
@@ -1018,12 +1030,6 @@ class IncubatorController:
 
     def start_incubator(self, temp_c: float | None = None, interval_s: int | None = None) -> dict[str, Any]:
         with self.lock:
-            parsed_temp: float | None = None
-            if temp_c is not None:
-                parsed_temp = self._parse_temp(temp_c)
-                if parsed_temp is None:
-                    self.last_error = "Température hors plage 0–110 °C"
-                    return self.status()
             if interval_s is not None:
                 error = self._assign_photo_interval(interval_s)
                 if error:
@@ -1035,8 +1041,6 @@ class IncubatorController:
             if self.vent_duration_s >= self.vent_interval_s:
                 self.last_error = "L'air doit rester allumé moins longtemps qu'il ne se relance"
                 return self.status()
-            if parsed_temp is not None:
-                self.target_temp = parsed_temp
             self.incubator_running = True
             if self.heat_forced:
                 bed = round(max(0.0, min(110.0, self.forced_bed_temp)), 1)
@@ -1067,6 +1071,9 @@ class IncubatorController:
             up, elevation = sun_is_up(self.sun_lat, self.sun_lon)
             self.sun_elevation = elevation
             self._ensure_light(up, force=True)
+            air = self._air_c()
+            if air is not None:
+                self._sync_cool_vent(air)
             self.last_error = ""
             return self.status()
 
@@ -1510,7 +1517,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <section class="kpi" aria-label="Mesures">
       <div class="kpi-card"><div class="label">Plateau</div><div class="value" id="bedActual">—<small> °C</small></div><div class="band" id="bedCmd"></div></div>
-      <div class="kpi-card"><div class="label">Consigne BME</div><div class="value" id="bedTarget">—<small> °C</small></div></div>
+      <div class="kpi-card"><div class="label">Plage</div><div class="value" id="bedTarget">—</div></div>
       <div class="kpi-card"><div class="label">Chambre</div><div class="value" id="chamberTemp">—<small> °C</small></div></div>
       <div class="kpi-card" id="kpiCultureTemp">
         <div class="label">Température culture</div>
@@ -1547,9 +1554,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="body">
           <div class="set-list">
             <div class="set-row">
-              <span class="name">BME °C</span>
-              <input id="temp" type="number" min="0" max="110" step="0.5" value="22" title="Consigne de la température BME" />
-              <button type="button" class="btn-gold btn-icon" id="btnSetTemp" title="Enregistrer la consigne BME" aria-label="Enregistrer la consigne BME"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
+              <span class="name">Min °C</span>
+              <input id="tempMin" type="number" min="0" max="110" step="0.5" value="18" title="Minimum de la plage BME" />
+              <button type="button" class="btn-gold btn-icon" id="btnSetRangeMin" title="Enregistrer la plage" aria-label="Enregistrer la plage"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
+            </div>
+            <div class="set-row">
+              <span class="name">Max °C</span>
+              <input id="tempMax" type="number" min="0" max="110" step="0.5" value="26" title="Maximum de la plage BME" />
+              <button type="button" class="btn-gold btn-icon" id="btnSetRangeMax" title="Enregistrer la plage" aria-label="Enregistrer la plage"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
             </div>
             <div class="set-row">
               <span class="name">Forcer plateau °C</span>
@@ -1589,8 +1601,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <button type="button" class="btn-ghost" id="btnStopKeep">Pause</button>
                 <button type="button" class="btn-danger" id="btnOff">Éteindre</button>
               </div>
-              <p class="hint">Démarrer asservit le plateau à la température du BME (plafond 60 °C), lance le cycle d'air et l'éclairage soleil. Au-dessus de la consigne, la ventilation reste allumée pour accélérer le refroidissement. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
-              <button type="button" class="btn-ghost" id="btnHeatAuto" hidden>Reprendre le BME</button>
+              <p class="hint">La plage min–max est la consigne du BME. En dessous, le plateau chauffe (plafond 60 °C). Au-dessus, il baisse et la ventilation reste allumée. Dedans, on garde l'état en cours. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
+              <button type="button" class="btn-ghost" id="btnHeatAuto" hidden>Reprendre la plage</button>
             </div>
           </div>
 
@@ -1620,7 +1632,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </div>
           <div class="chart-legend">
             <span><i class="swatch" style="background:#3ddc97"></i>Plateau</span>
-            <span><i class="swatch" style="background:#e6b35a"></i>Consigne BME</span>
+            <span><i class="swatch" style="background:#e6b35a"></i>Min</span>
+            <span><i class="swatch" style="background:#c4a15a"></i>Max</span>
             <span><i class="swatch" style="background:#6ec8ff"></i>Température culture</span>
             <span><i class="swatch" style="background:#ff8f6b"></i>Chambre</span>
             <span><i class="swatch" style="background:#c9a0ff"></i>Humidité culture</span>
@@ -1645,7 +1658,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <form id="cfgForm">
       <h2>Configuration</h2>
       <div>
-        <div class="name" style="font-weight:560;margin-bottom:6px">Plage température culture</div>
+        <div class="name" style="font-weight:560;margin-bottom:6px">Plage température culture — consigne du BME</div>
         <div class="dlg-grid">
           <div><label for="cfgTempMin">Min °C</label><input id="cfgTempMin" type="number" min="0" max="110" step="0.5" /></div>
           <div><label for="cfgTempMax">Max °C</label><input id="cfgTempMax" type="number" min="0" max="110" step="0.5" /></div>
@@ -1760,7 +1773,7 @@ function applyStatus(s) {
   $("dot").className = "dot " + (s.connected ? "ok" : "bad");
   $("connLabel").textContent = s.connected
     ? (s.incubator_running
-        ? (s.heat_forced ? "Incubateur · plateau forcé" : "Incubateur · BME")
+        ? (s.heat_forced ? "Incubateur · plateau forcé" : "Incubateur · plage")
         : (s.heat_forced || s.heater_on ? "Chauffe forcée" : "Imprimante OK"))
     : "Imprimante absente";
   $("dotLink").className = "dot " + (linkOnline ? "ok" : "bad");
@@ -1773,7 +1786,7 @@ function applyStatus(s) {
   $("bedCmd").textContent = s.heat_forced
     ? `forcé ${fmtNum(bedOrder, 1)} °C`
     : (s.incubator_running ? `ordre ${fmtNum(bedOrder, 1)} °C` : (s.heater_on ? `manuel ${fmtNum(bedOrder, 1)} °C` : ""));
-  $("bedTarget").innerHTML = (s.target_temp ?? "—") + "<small> °C</small>";
+  $("bedTarget").innerHTML = `${fmtNum(s.culture_temp_min, 1)}–${fmtNum(s.culture_temp_max, 1)}<small> °C</small>`;
   $("chamberTemp").innerHTML = fmtNum(s.chamber_c) + "<small> °C</small>";
   $("photoCount").textContent = s.photo_count ?? 0;
   $("ventActual").innerHTML = (s.vent_actual != null ? Math.round(s.vent_actual) : "—") + "<small> %</small>";
@@ -1787,7 +1800,8 @@ function applyStatus(s) {
   $("cultureTempBand").textContent = `${fmtNum(s.culture_temp_min, 1)} – ${fmtNum(s.culture_temp_max, 1)} °C`;
   $("cultureHumBand").textContent = `${fmtNum(s.culture_hum_min, 0)} – ${fmtNum(s.culture_hum_max, 0)} %`;
 
-  setIfIdle("temp", s.target_temp);
+  setIfIdle("tempMin", s.culture_temp_min);
+  setIfIdle("tempMax", s.culture_temp_max);
   setIfIdle("forceTemp", s.forced_bed_temp);
   setIfIdle("interval", s.photo_interval_s);
   setIfIdle("ventSpeed", s.vent_speed);
@@ -1806,7 +1820,7 @@ function applyStatus(s) {
   if (s.last_error) showErr(s.last_error);
   else showErr("");
 
-  const regime = s.heat_forced ? "plateau forcé" : "BME";
+  const regime = s.heat_forced ? "plateau forcé" : "plage";
   const cooling = s.cool_vent ? " · ventilation" : "";
   $("runState").textContent = s.incubator_running
     ? `ON · ${regime}${cooling} · photo / ${s.photo_interval_s} s · prochaine ${fmtRemain(s.photo_next_s)}`
@@ -1856,7 +1870,8 @@ let chartPoints = [];
 let chartHover = -1;
 const SERIES = [
   { key: "bed_actual_c", color: "#3ddc97", axis: "temp", label: "Plateau", digits: 2, unit: "°C" },
-  { key: "consigne_c", color: "#e6b35a", axis: "temp", label: "Consigne BME", digits: 2, unit: "°C" },
+  { key: "culture_min_c", color: "#e6b35a", axis: "temp", label: "Min", digits: 1, unit: "°C", dash: true },
+  { key: "culture_max_c", color: "#c4a15a", axis: "temp", label: "Max", digits: 1, unit: "°C", dash: true },
   { key: "air_c", color: "#6ec8ff", axis: "temp", label: "Température culture", digits: 2, unit: "°C" },
   { key: "chamber_c", color: "#ff8f6b", axis: "temp", label: "Chambre", digits: 2, unit: "°C" },
   { key: "humidity_pct", color: "#c9a0ff", axis: "hum", label: "Humidité culture", digits: 1, unit: "%" },
@@ -1963,8 +1978,8 @@ function drawMetricsChart(points, hoverIdx = -1) {
       else ctx.lineTo(x, y);
     }
     ctx.strokeStyle = s.color;
-    ctx.lineWidth = s.key === "consigne_c" ? 1.5 : 2;
-    ctx.setLineDash(s.key === "consigne_c" ? [5, 4] : []);
+    ctx.lineWidth = s.dash ? 1.5 : 2;
+    ctx.setLineDash(s.dash ? [5, 4] : []);
     ctx.stroke();
     ctx.setLineDash([]);
   }
@@ -2128,10 +2143,18 @@ async function applyVentParams() {
   await applyVent(ventMode || "off");
 }
 
-$("btnSetTemp").onclick = async () => {
-  await api("/api/heater", { method: "POST", body: JSON.stringify({ temp: clampInput("temp") }) });
+async function saveTempRange() {
+  await api("/api/settings", {
+    method: "POST",
+    body: JSON.stringify({
+      culture_temp_min: clampInput("tempMin"),
+      culture_temp_max: clampInput("tempMax"),
+    }),
+  });
   refreshStatus();
-};
+}
+$("btnSetRangeMin").onclick = () => saveTempRange();
+$("btnSetRangeMax").onclick = () => saveTempRange();
 $("btnForce").onclick = async () => {
   await api("/api/heater", {
     method: "POST",
@@ -2157,7 +2180,7 @@ $("btnSetVentDuration").onclick = () => applyVentParams();
 $("btnStart").onclick = async () => {
   await api("/api/incubator/start", {
     method: "POST",
-    body: JSON.stringify({ temp: clampInput("temp"), interval_s: clampInput("interval") }),
+    body: JSON.stringify({ interval_s: clampInput("interval") }),
   });
   refreshStatus(); bumpCam(); refreshGallery();
 };
@@ -2508,7 +2531,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, CTRL.release_heat_force())
                 if body.get("force"):
                     return self._json(200, CTRL.force_bed(body.get("temp", CTRL.forced_bed_temp)))
-                return self._json(200, CTRL.set_air_target(body.get("temp", CTRL.target_temp)))
+                return self._json(400, {"error": "La consigne est la plage min/max"})
             if path == "/api/heater/off":
                 return self._json(200, CTRL.heater_off())
             if path == "/api/incubator/start":
