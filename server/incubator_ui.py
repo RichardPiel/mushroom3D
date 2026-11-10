@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import mimetypes
 import os
 import secrets
@@ -56,6 +57,7 @@ METRICS_FIELDS = (
     "vent_actual_pct",
     "air_c",
     "humidity_pct",
+    "light_on",
     "photo",
 )
 METRICS_WINDOWS = {
@@ -64,6 +66,7 @@ METRICS_WINDOWS = {
     "24h": 24 * 60 * 60,
 }
 METRICS_SERIES = ("bed_actual_c", "consigne_c", "air_c", "humidity_pct")
+METRICS_FLAGS = ("vent_on", "light_on")
 
 AUTH_PASSWORD = os.environ.get("INCUBATOR_PASSWORD", "")
 RELAY_TOKEN = os.environ.get("RELAY_TOKEN", "")
@@ -78,6 +81,9 @@ DEFAULT_PHOTO_INTERVAL_S = 1800
 DEFAULT_VENT_SPEED = 60
 DEFAULT_VENT_INTERVAL_S = 1800
 DEFAULT_VENT_ON_S = 120
+DEFAULT_SUN_LAT = 48.8566
+DEFAULT_SUN_LON = 2.3522
+SUN_UP_ELEVATION_DEG = -0.833
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,6 +156,76 @@ def _float_or_none(raw: str) -> float | None:
         return None
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _cfg_float(cfg: dict[str, Any], key: str, default: float) -> float:
+    try:
+        return float(cfg[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def _cfg_int(cfg: dict[str, Any], key: str, default: int) -> int:
+    try:
+        return int(cfg[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def _julian_day(when: datetime) -> float:
+    when = when.astimezone(timezone.utc)
+    year, month = when.year, when.month
+    day = when.day + (when.hour + (when.minute + when.second / 60) / 60) / 24
+    if month <= 2:
+        year -= 1
+        month += 12
+    century = year // 100
+    return (
+        int(365.25 * (year + 4716))
+        + int(30.6001 * (month + 1))
+        + day
+        + (2 - century + century // 4)
+        - 1524.5
+    )
+
+
+def solar_elevation_deg(latitude: float, longitude: float, when: datetime) -> float:
+    """Élévation du soleil en degrés. Positif : au-dessus de l'horizon géométrique."""
+    n = _julian_day(when) - 2451545.0
+    mean_lon = math.radians((280.460 + 0.9856474 * n) % 360)
+    anomaly = math.radians((357.528 + 0.9856003 * n) % 360)
+    ecliptic = (
+        mean_lon
+        + math.radians(1.915) * math.sin(anomaly)
+        + math.radians(0.020) * math.sin(2 * anomaly)
+    )
+    obliquity = math.radians(23.439 - 0.0000004 * n)
+    right_asc = math.atan2(math.cos(obliquity) * math.sin(ecliptic), math.cos(ecliptic))
+    declination = math.asin(math.sin(obliquity) * math.sin(ecliptic))
+    gmst = math.radians((280.46061837 + 360.98564736629 * n) % 360)
+    hour_angle = gmst + math.radians(longitude) - right_asc
+    lat = math.radians(latitude)
+    elevation = math.asin(
+        math.sin(lat) * math.sin(declination)
+        + math.cos(lat) * math.cos(declination) * math.cos(hour_angle)
+    )
+    return math.degrees(elevation)
+
+
+def sun_is_up(latitude: float, longitude: float, when: datetime | None = None) -> tuple[bool, float]:
+    when = when or datetime.now(timezone.utc)
+    elevation = solar_elevation_deg(latitude, longitude, when)
+    return elevation >= SUN_UP_ELEVATION_DEG, elevation
+
+
 def read_metrics_window(window: str = "60m", max_points: int = 480) -> dict[str, Any]:
     """Points CSV dans la fenêtre demandée (5m / 60m / 24h), sous-échantillonnés."""
     key = (window or "60m").strip().lower()
@@ -166,13 +242,23 @@ def read_metrics_window(window: str = "60m", max_points: int = 480) -> dict[str,
                 if ts is None or ts.timestamp() < cutoff:
                     continue
                 item: dict[str, Any] = {"t": ts.strftime("%Y-%m-%dT%H:%M:%SZ")}
-                for field in METRICS_SERIES:
+                for field in (*METRICS_SERIES, *METRICS_FLAGS):
                     item[field] = _float_or_none(row.get(field, ""))
                 points.append(item)
     if len(points) > max_points and max_points > 1:
         step = len(points) / max_points
-        picked = [points[int(i * step)] for i in range(max_points - 1)]
-        picked.append(points[-1])
+        picked: list[dict[str, Any]] = []
+        for i in range(max_points - 1):
+            start = int(i * step)
+            end = max(int((i + 1) * step), start + 1)
+            item = dict(points[start])
+            chunk = points[start:end]
+            for flag in METRICS_FLAGS:
+                values = [pt[flag] for pt in chunk if pt.get(flag) is not None]
+                if values:
+                    item[flag] = 1.0 if any(value >= 0.5 for value in values) else 0.0
+            picked.append(item)
+        picked.append(dict(points[-1]))
         points = picked
     return {"window": key, "span_s": span_s, "count": len(points), "points": points}
 
@@ -236,11 +322,20 @@ class IncubatorController:
         self.printer_ip = ""
         self.last_error = ""
 
+        cfg = _load_config()
         self.target_temp = float(DEFAULT_TARGET_TEMP)
-        self.photo_interval_s = int(DEFAULT_PHOTO_INTERVAL_S)
+        self.photo_interval_s = _cfg_int(cfg, "photo_interval_s", DEFAULT_PHOTO_INTERVAL_S)
+        if not (10 <= self.photo_interval_s <= 86400):
+            self.photo_interval_s = int(DEFAULT_PHOTO_INTERVAL_S)
         self.heater_on = False
         self.incubator_running = False
         self.light_on = False
+        self.light_mode = cfg.get("light_mode") if cfg.get("light_mode") in ("manual", "sun") else "manual"
+        self.sun_lat = _cfg_float(cfg, "sun_lat", _env_float("SUN_LAT", DEFAULT_SUN_LAT))
+        self.sun_lon = _cfg_float(cfg, "sun_lon", _env_float("SUN_LON", DEFAULT_SUN_LON))
+        self.sun_elevation = 0.0
+        self._last_auto_photo = time.monotonic()
+        self._last_light_cmd = 0.0
 
         self.vent_mode = "off"
         self.vent_on = False
@@ -272,6 +367,7 @@ class IncubatorController:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         self._ensure_metrics_csv()
         self._refresh_photo_count()
+        threading.Thread(target=self._scheduler, name="incubator-scheduler", daemon=True).start()
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -279,7 +375,21 @@ class IncubatorController:
 
     def _ensure_metrics_csv(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        if METRICS_CSV.is_file():
+        expected = ",".join(METRICS_FIELDS)
+        if METRICS_CSV.is_file() and METRICS_CSV.stat().st_size > 0:
+            with METRICS_CSV.open("r", encoding="utf-8", newline="") as fh:
+                header = fh.readline().strip()
+            if header == expected:
+                return
+            with METRICS_CSV.open("r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            tmp = METRICS_CSV.with_suffix(".csv.tmp")
+            with tmp.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=METRICS_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") or "" for key in METRICS_FIELDS})
+            tmp.replace(METRICS_CSV)
             return
         with METRICS_CSV.open("w", encoding="utf-8", newline="") as fh:
             csv.DictWriter(fh, fieldnames=METRICS_FIELDS).writeheader()
@@ -309,6 +419,7 @@ class IncubatorController:
                     if self.bme680.get("humidity_pct") is None
                     else f"{float(self.bme680['humidity_pct']):.1f}"
                 ),
+                "light_on": int(bool(self.light_on)),
                 "photo": photo or "",
             }
             with METRICS_CSV.open("a", encoding="utf-8", newline="") as fh:
@@ -339,11 +450,17 @@ class IncubatorController:
                 "last_error": self.last_error,
                 "target_temp": self.target_temp,
                 "photo_interval_s": self.photo_interval_s,
+                "photo_next_s": self._photo_next_s(),
                 "heater_on": self.heater_on,
                 "incubator_running": self.incubator_running,
                 "camera_on": bool(self.camera_url),
                 "camera_url": self.camera_url,
                 "light_on": self.light_on,
+                "light_mode": self.light_mode,
+                "sun_lat": self.sun_lat,
+                "sun_lon": self.sun_lon,
+                "sun_elevation": round(self.sun_elevation, 1),
+                "sun_up": self.sun_elevation >= SUN_UP_ELEVATION_DEG,
                 "vent_mode": self.vent_mode,
                 "vent_on": self.vent_on,
                 "vent_speed": self.vent_speed,
@@ -532,6 +649,28 @@ class IncubatorController:
                 }
             )
             self.last_error = ""
+            self._append_metrics()
+            return self.status()
+
+    def _assign_photo_interval(self, interval_s: int) -> str | None:
+        """Caller holds self.lock. Returns an error message, or None."""
+        try:
+            interval_s = int(interval_s)
+        except (TypeError, ValueError):
+            return "Intervalle photo invalide"
+        if not (10 <= interval_s <= 86400):
+            return "Intervalle photo hors plage 10 s – 24 h"
+        self.photo_interval_s = interval_s
+        _save_config({"photo_interval_s": interval_s})
+        return None
+
+    def set_photo_interval(self, interval_s: int) -> dict[str, Any]:
+        with self.lock:
+            error = self._assign_photo_interval(interval_s)
+            if error:
+                self.last_error = error
+                return self.status()
+            self.last_error = ""
             return self.status()
 
     def start_incubator(self, temp_c: float | None = None, interval_s: int | None = None) -> dict[str, Any]:
@@ -539,10 +678,14 @@ class IncubatorController:
             if temp_c is not None:
                 self.target_temp = float(temp_c)
             if interval_s is not None:
-                self.photo_interval_s = max(10, int(interval_s))
+                error = self._assign_photo_interval(interval_s)
+                if error:
+                    self.last_error = error
+                    return self.status()
             self.heater_on = True
             self.incubator_running = True
             self.started_at = time.time()
+            self._last_auto_photo = time.monotonic() - self.photo_interval_s
             self._enqueue({"type": "incubator_start", "temp": self.target_temp})
             self.last_error = ""
             return self.status()
@@ -555,12 +698,105 @@ class IncubatorController:
             self._enqueue({"type": "incubator_stop", "turn_off_heat": bool(turn_off_heat)})
             return self.status()
 
-    def set_light(self, on: bool) -> dict[str, Any]:
+    def _photo_next_s(self) -> int | None:
+        """Caller holds self.lock."""
+        if not self.incubator_running:
+            return None
+        remain = self.photo_interval_s - (time.monotonic() - self._last_auto_photo)
+        return max(0, int(remain))
+
+    def _assign_sun_place(self, lat: float, lon: float) -> str | None:
+        """Caller holds self.lock."""
+        try:
+            lat = float(lat)
+            lon = float(lon)
+        except (TypeError, ValueError):
+            return "Latitude ou longitude invalide"
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return "Latitude hors −90…90 ou longitude hors −180…180"
+        self.sun_lat = lat
+        self.sun_lon = lon
+        _save_config({"sun_lat": lat, "sun_lon": lon})
+        up, elevation = sun_is_up(lat, lon)
+        self.sun_elevation = elevation
+        return None
+
+    def _command_light(self, on: bool) -> None:
+        """Caller holds self.lock."""
+        self.light_on = bool(on)
+        self._last_light_cmd = time.monotonic()
+        self._enqueue({"type": "light", "on": self.light_on})
+        self._append_metrics()
+
+    def set_light(
+        self,
+        on: bool | None = None,
+        *,
+        mode: str | None = None,
+        lat: float | None = None,
+        lon: float | None = None,
+    ) -> dict[str, Any]:
         with self.lock:
-            self.light_on = bool(on)
-            self._enqueue({"type": "light", "on": bool(on)})
+            if lat is not None or lon is not None:
+                error = self._assign_sun_place(
+                    self.sun_lat if lat is None else lat,
+                    self.sun_lon if lon is None else lon,
+                )
+                if error:
+                    self.last_error = error
+                    return self.status()
+            if mode in ("manual", "sun"):
+                self.light_mode = mode
+                _save_config({"light_mode": mode})
+            elif mode is not None:
+                self.last_error = "Mode lumière inconnu"
+                return self.status()
+            if on is None and self.light_mode == "sun":
+                up, elevation = sun_is_up(self.sun_lat, self.sun_lon)
+                self.sun_elevation = elevation
+                on = up
+            if on is None:
+                self.last_error = ""
+                return self.status()
+            self._command_light(bool(on))
             self.last_error = ""
             return self.status()
+
+    def _scheduler(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._tick_sun()
+                self._tick_photos()
+            except Exception:
+                log.exception("Scheduler")
+            self._stop.wait(1.0)
+
+    def _tick_sun(self) -> None:
+        up, elevation = sun_is_up(self.sun_lat, self.sun_lon)
+        with self.lock:
+            self.sun_elevation = elevation
+            if self.light_mode != "sun":
+                return
+            if any(cmd.get("type") == "light" for cmd in self.commands):
+                return
+            if time.monotonic() - self._last_light_cmd < 20:
+                return
+            if self.light_on == up:
+                return
+            self._command_light(up)
+
+    def _tick_photos(self) -> None:
+        with self.lock:
+            if not self.incubator_running:
+                return
+            if time.monotonic() - self._last_auto_photo < self.photo_interval_s:
+                return
+            self._last_auto_photo = time.monotonic()
+        result = self.take_snapshot()
+        if not result.get("ok"):
+            with self.lock:
+                retry = min(30, self.photo_interval_s)
+                self._last_auto_photo = time.monotonic() - self.photo_interval_s + retry
 
     def camera_enable(self) -> dict[str, Any]:
         # Activation locale côté carte via SDCP ; le preview passe par camera_url.
@@ -755,7 +991,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .seg { display: inline-flex; flex-wrap: wrap; gap: 6px; }
   .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
   .chart-wrap {
-    position: relative; width: 100%; height: 260px; margin-top: 8px;
+    position: relative; width: 100%; height: 320px; margin-top: 8px;
     border-radius: 12px; background: rgba(255,255,255,.03); border: 1px solid var(--line);
   }
   .chart-wrap canvas { width: 100%; height: 100%; display: block; }
@@ -821,6 +1057,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <button class="btn-ghost" id="btnSnap">Photo</button>
             <button class="btn-ghost" id="btnRefresh">Rafraîchir</button>
           </div>
+          <div class="actions">
+            <div class="seg" id="lightMode" role="group" aria-label="Mode du flash">
+              <button type="button" class="btn-ghost" data-mode="manual" aria-pressed="true">Manuel</button>
+              <button type="button" class="btn-ghost" data-mode="sun">Soleil</button>
+            </div>
+            <span class="hint" id="sunState" style="margin:0">—</span>
+          </div>
+          <div class="row">
+            <div>
+              <label for="sunLat">Latitude</label>
+              <input id="sunLat" type="number" min="-90" max="90" step="0.01" value="48.86" />
+            </div>
+            <div>
+              <label for="sunLon">Longitude</label>
+              <input id="sunLon" type="number" min="-180" max="180" step="0.01" value="2.35" />
+            </div>
+          </div>
+          <p class="hint">Soleil allume le flash tant que le soleil est levé à ces coordonnées. Défaut : Paris.</p>
         </div>
       </section>
 
@@ -847,7 +1101,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <input id="temp" type="number" min="0" max="110" step="0.5" value="22" />
               </div>
               <div>
-                <label for="interval">Photo / s</label>
+                <label for="interval">Entre photos (s)</label>
                 <input id="interval" type="number" min="10" step="10" value="1800" />
               </div>
             </div>
@@ -907,6 +1161,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <span><i class="swatch" style="background:#e6b35a"></i>Consigne</span>
           <span><i class="swatch" style="background:#6ec8ff"></i>Air BME</span>
           <span><i class="swatch" style="background:#c9a0ff"></i>Humidité %</span>
+          <span><i class="swatch" style="background:#5ee0c2"></i>Ventilation</span>
+          <span><i class="swatch" style="background:#ffd07a"></i>Flash</span>
         </div>
       </div>
     </section>
@@ -914,7 +1170,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <section class="panel" style="margin-top:14px">
       <h2>Time-lapse</h2>
       <div class="body">
-        <p class="hint" style="margin-top:0">Photos + journal CSV (températures, consigne, ventilation) à chaque télémétrie.</p>
+        <p class="hint" style="margin-top:0">Photos + journal CSV (températures, consigne, ventilation, flash) à chaque télémétrie.</p>
         <div class="actions" style="margin-top:0;margin-bottom:10px">
           <button type="button" class="btn-gold" id="btnMetrics">Télécharger metrics.csv</button>
         </div>
@@ -944,8 +1200,14 @@ async function api(path, opts) {
 
 function setIfIdle(id, value) {
   const el = $(id);
-  if (document.activeElement !== el) el.value = value ?? "";
+  if (!el || document.activeElement === el || el.dataset.dirty === "1") return;
+  el.value = value ?? "";
 }
+function watchDirty(id) {
+  const el = $(id);
+  if (el) el.addEventListener("input", () => { el.dataset.dirty = "1"; });
+}
+["interval", "sunLat", "sunLon"].forEach(watchDirty);
 
 function fmtRemain(s) {
   if (s == null) return "—";
@@ -995,13 +1257,22 @@ function applyStatus(s) {
   else err.classList.remove("show");
 
   $("runState").textContent = s.incubator_running
-    ? `État : incubateur ON · dernière photo ${s.last_photo || "—"}`
+    ? `État : incubateur ON · photo / ${s.photo_interval_s} s · prochaine ${fmtRemain(s.photo_next_s)}`
     : (s.heater_on ? "État : chauffe manuelle" : "État : veille");
 
   const lightBtn = $("btnLight");
   lightBtn.textContent = s.light_on ? "Flash off" : "Flash";
   lightBtn.className = s.light_on ? "btn-ghost" : "btn-gold";
   lightBtn.dataset.on = s.light_on ? "1" : "0";
+  const sunEl = Number(s.sun_elevation);
+  $("sunState").textContent = Number.isFinite(sunEl)
+    ? `${s.sun_up ? "Jour" : "Nuit"} · soleil ${sunEl.toFixed(0)}°`
+    : "—";
+  for (const b of $("lightMode").querySelectorAll("button")) {
+    b.setAttribute("aria-pressed", b.dataset.mode === (s.light_mode || "manual") ? "true" : "false");
+  }
+  setIfIdle("sunLat", s.sun_lat);
+  setIfIdle("sunLon", s.sun_lon);
 
   const manualBtn = $("btnVentManual");
   const cycleBtn = $("btnVentCycle");
@@ -1064,6 +1335,10 @@ const SERIES = [
   { key: "air_c", color: "#6ec8ff", axis: "temp" },
   { key: "humidity_pct", color: "#c9a0ff", axis: "hum" },
 ];
+const LANES = [
+  { key: "vent_on", color: "rgba(94, 224, 194, .9)", label: "Vent" },
+  { key: "light_on", color: "rgba(255, 208, 122, .95)", label: "Flash" },
+];
 
 function niceRange(min, max, pad = 0.08) {
   if (!Number.isFinite(min) || !Number.isFinite(max)) return { min: 0, max: 1 };
@@ -1077,13 +1352,15 @@ function drawMetricsChart(points) {
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth || 1100;
-  const cssH = canvas.clientHeight || 260;
+  const cssH = canvas.clientHeight || 320;
   canvas.width = Math.round(cssW * dpr);
   canvas.height = Math.round(cssH * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, cssW, cssH);
 
-  const pad = { l: 44, r: 44, t: 16, b: 28 };
+  const laneH = 12;
+  const laneGap = 4;
+  const pad = { l: 48, r: 44, t: 16, b: 22 + LANES.length * (laneH + laneGap) };
   const w = cssW - pad.l - pad.r;
   const h = cssH - pad.t - pad.b;
 
@@ -1123,9 +1400,10 @@ function drawMetricsChart(points) {
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + w, y); ctx.stroke();
     const tv = tR.max - (i / 4) * (tR.max - tR.min);
     const hv = hR.max - (i / 4) * (hR.max - hR.min);
-    ctx.fillText(tv.toFixed(1), pad.l - 8, y + 3);
+    const labelY = i === 4 ? y - 3 : y + 3;
+    ctx.fillText(tv.toFixed(1), pad.l - 8, labelY);
     ctx.textAlign = "left";
-    ctx.fillText(hv.toFixed(0) + "%", pad.l + w + 8, y + 3);
+    ctx.fillText(hv.toFixed(0) + "%", pad.l + w + 8, labelY);
     ctx.textAlign = "right";
   }
 
@@ -1136,7 +1414,10 @@ function drawMetricsChart(points) {
     const label = chartWindow === "24h"
       ? t.toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })
       : t.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: chartWindow === "5m" ? "2-digit" : undefined });
-    ctx.fillText(label, xAt(i), cssH - 8);
+    if (points.length > 1 && i === 0) ctx.textAlign = "left";
+    else if (points.length > 1 && i === points.length - 1) ctx.textAlign = "right";
+    else ctx.textAlign = "center";
+    ctx.fillText(label, xAt(i), pad.t + h + 13);
   }
 
   for (const s of SERIES) {
@@ -1157,6 +1438,32 @@ function drawMetricsChart(points) {
     ctx.stroke();
     ctx.setLineDash([]);
   }
+
+  LANES.forEach((lane, row) => {
+    const y = pad.t + h + 20 + row * (laneH + laneGap);
+    ctx.fillStyle = "rgba(255,255,255,.05)";
+    ctx.fillRect(pad.l, y, w, laneH);
+    ctx.fillStyle = lane.color;
+    let start = null;
+    const flush = (end) => {
+      if (start == null) return;
+      const x1 = xAt(start);
+      const x2 = xAt(end);
+      ctx.fillRect(x1, y, Math.max(3, x2 - x1), laneH);
+      start = null;
+    };
+    for (let i = 0; i < points.length; i++) {
+      const v = points[i][lane.key];
+      const on = v != null && v >= 0.5;
+      if (on && start == null) start = i;
+      if (!on && start != null) flush(i - 1);
+    }
+    if (start != null) flush(points.length - 1);
+    ctx.fillStyle = "#8d9893";
+    ctx.textAlign = "right";
+    ctx.font = "10px Outfit, system-ui, sans-serif";
+    ctx.fillText(lane.label, pad.l - 6, y + laneH - 2);
+  });
 }
 
 async function refreshChart() {
@@ -1186,8 +1493,25 @@ function bumpCam() {
   $("cam").src = "/api/camera.jpg?t=" + Date.now();
 }
 
+async function savePhotoInterval() {
+  await api("/api/photo_interval", {
+    method: "POST",
+    body: JSON.stringify({ interval_s: +$("interval").value }),
+  });
+  $("interval").dataset.dirty = "";
+}
+$("interval").addEventListener("change", async () => {
+  try {
+    await savePhotoInterval();
+    refreshStatus();
+  } catch (e) {
+    $("err").textContent = e.message || String(e);
+    $("err").classList.add("show");
+  }
+});
 $("btnSetTemp").onclick = async () => {
   await api("/api/heater", { method: "POST", body: JSON.stringify({ temp: +$("temp").value }) });
+  await savePhotoInterval();
   refreshStatus();
 };
 $("btnStart").onclick = async () => {
@@ -1195,6 +1519,7 @@ $("btnStart").onclick = async () => {
     method: "POST",
     body: JSON.stringify({ temp: +$("temp").value, interval_s: +$("interval").value }),
   });
+  $("interval").dataset.dirty = "";
   refreshStatus(); bumpCam(); refreshGallery();
 };
 $("btnStopKeep").onclick = async () => {
@@ -1225,10 +1550,25 @@ $("btnVentOff").onclick = async () => {
   await api("/api/vent", { method: "POST", body: ventBody("off") });
   refreshStatus();
 };
+function sunPlace() {
+  return { lat: +$("sunLat").value, lon: +$("sunLon").value };
+}
 $("btnLight").onclick = async () => {
   const next = $("btnLight").dataset.on !== "1";
-  await api("/api/light", { method: "POST", body: JSON.stringify({ on: next }) });
+  await api("/api/light", { method: "POST", body: JSON.stringify({ on: next, mode: "manual", ...sunPlace() }) });
+  $("sunLat").dataset.dirty = "";
+  $("sunLon").dataset.dirty = "";
   bumpCam(); refreshStatus();
+};
+$("lightMode").onclick = async (ev) => {
+  const btn = ev.target.closest("button[data-mode]");
+  if (!btn) return;
+  const body = { mode: btn.dataset.mode, ...sunPlace() };
+  if (body.mode === "manual") body.on = $("btnLight").dataset.on === "1";
+  await api("/api/light", { method: "POST", body: JSON.stringify(body) });
+  $("sunLat").dataset.dirty = "";
+  $("sunLon").dataset.dirty = "";
+  refreshStatus();
 };
 $("btnSnap").onclick = async () => {
   const r = await api("/api/snapshot", { method: "POST", body: "{}" });
@@ -1253,7 +1593,7 @@ refreshChart();
 setInterval(refreshStatus, 4000);
 setInterval(bumpCam, 2500);
 setInterval(refreshGallery, 15000);
-setInterval(refreshChart, 15000);
+setInterval(refreshChart, 5000);
 </script>
 </body>
 </html>
@@ -1552,8 +1892,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, CTRL.camera_enable())
             if path == "/api/camera/off":
                 return self._json(200, CTRL.camera_disable())
+            if path == "/api/photo_interval":
+                if "interval_s" not in body:
+                    return self._json(400, {"error": "interval_s requis"})
+                return self._json(200, CTRL.set_photo_interval(body.get("interval_s")))
             if path == "/api/light":
-                return self._json(200, CTRL.set_light(bool(body.get("on", True))))
+                mode = body.get("mode")
+                return self._json(
+                    200,
+                    CTRL.set_light(
+                        body.get("on") if "on" in body else None,
+                        mode=None if mode is None else str(mode),
+                        lat=body.get("lat") if "lat" in body else None,
+                        lon=body.get("lon") if "lon" in body else None,
+                    ),
+                )
             if path == "/api/vent":
                 return self._json(
                     200,
