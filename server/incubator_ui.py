@@ -104,6 +104,9 @@ BED_AUTO_MIN = 0.0
 BED_AUTO_MAX = 60.0
 BED_SLEW_C = 2.0
 AIR_LOOKAHEAD_S = 180.0
+AIR_HISTORY_S = 1800.0
+FORECAST_MIN_S = 60
+FORECAST_MAX_S = 1800
 AIR_RATE_MIN_SPAN_S = 45.0
 AIR_RATE_MAX = 0.03
 AIR_FORECAST_MIN_C = 0.2
@@ -429,6 +432,7 @@ class IncubatorController:
         self._air_hist: deque[tuple[float, float]] = deque()
         self._air_wall: deque[tuple[float, float]] = deque()
         self._air_rate = 0.0
+        self._air_rate_ready = False
         self._air_sane = True
         self._cool_vent = False
         self._last_photo_wall: float | None = None
@@ -458,6 +462,7 @@ class IncubatorController:
         self.culture_temp_max = _cfg_float(cfg, "culture_temp_max", DEFAULT_CULTURE_TEMP_MAX)
         self.culture_hum_min = _cfg_float(cfg, "culture_hum_min", DEFAULT_CULTURE_HUM_MIN)
         self.culture_hum_max = _cfg_float(cfg, "culture_hum_max", DEFAULT_CULTURE_HUM_MAX)
+        self.forecast_s = self._clamp_forecast_s(cfg.get("forecast_s", AIR_LOOKAHEAD_S))
         self.vent_actual: float | None = None
         self.vent_remaining_s: int | None = None
 
@@ -528,6 +533,7 @@ class IncubatorController:
             "culture_temp_max": self.culture_temp_max,
             "culture_hum_min": self.culture_hum_min,
             "culture_hum_max": self.culture_hum_max,
+            "forecast_s": self.forecast_s,
             "camera_url": self.camera_url,
             "sun_lat": self.sun_lat,
             "sun_lon": self.sun_lon,
@@ -589,11 +595,12 @@ class IncubatorController:
             ("sun_lat", "sun_lat"),
             ("sun_lon", "sun_lon"),
             ("heat_i", "_heat_i"),
+            ("forecast_s", "forecast_s"),
         ):
             if state.get(key) is None:
                 continue
             try:
-                setattr(self, attr, float(state[key]) if key in ("heat_i", "target_temp", "forced_bed_temp", "culture_temp_min", "culture_temp_max", "culture_hum_min", "culture_hum_max", "sun_lat", "sun_lon") else int(state[key]) if key in ("vent_speed", "vent_interval_s", "vent_duration_s", "photo_interval_s") else float(state[key]))
+                setattr(self, attr, float(state[key]) if key in ("heat_i", "target_temp", "forced_bed_temp", "culture_temp_min", "culture_temp_max", "culture_hum_min", "culture_hum_max", "sun_lat", "sun_lon") else int(state[key]) if key in ("vent_speed", "vent_interval_s", "vent_duration_s", "photo_interval_s", "forecast_s") else float(state[key]))
             except (TypeError, ValueError):
                 continue
         if "bed_command" in state and state["bed_command"] is not None:
@@ -657,10 +664,11 @@ class IncubatorController:
             except (TypeError, ValueError):
                 continue
             age = now_w - wall
-            if age < 0 or age > AIR_LOOKAHEAD_S:
+            if age < 0 or age > AIR_HISTORY_S:
                 continue
             self._air_wall.append((wall, temp))
             self._air_hist.append((now_m - age, temp))
+        self.forecast_s = self._clamp_forecast_s(self.forecast_s)
         self._recompute_air_rate()
         log.info(
             "État restauré — incubateur %s, plateau %s °C, %s photo(s)",
@@ -824,6 +832,8 @@ class IncubatorController:
                 "uptime_s": (now - self.started_at) if self.started_at else 0,
                 "stream_proxy": "/api/camera.jpg",
                 "bme680": dict(self.bme680),
+                "air_rate_c_min": self._air_rate_c_min(),
+                "air_forecast_s": int(self.forecast_s),
                 "link": {
                     "online": online,
                     "age_s": None if age is None else round(age, 1),
@@ -887,6 +897,21 @@ class IncubatorController:
                 self.camera_url = url
                 patch["camera_url"] = url
                 self._enqueue({"type": "camera_url", "url": url})
+            if "forecast_min" in body or "forecast_s" in body:
+                try:
+                    if "forecast_min" in body:
+                        seconds = float(body.get("forecast_min")) * 60.0
+                    else:
+                        seconds = float(body.get("forecast_s"))
+                except (TypeError, ValueError):
+                    self.last_error = "Durée de pente invalide"
+                    return self.status()
+                if not (FORECAST_MIN_S <= seconds <= FORECAST_MAX_S):
+                    self.last_error = "Durée de pente : 1 à 30 min"
+                    return self.status()
+                self.forecast_s = int(round(seconds))
+                patch["forecast_s"] = self.forecast_s
+                self._recompute_air_rate()
             if patch:
                 _save_config(patch)
             if "sun_lat" in body or "sun_lon" in body:
@@ -899,7 +924,10 @@ class IncubatorController:
                     return self.status()
             self.last_error = ""
             if self.incubator_running and (
-                "culture_temp_min" in body or "culture_temp_max" in body
+                "culture_temp_min" in body
+                or "culture_temp_max" in body
+                or "forecast_min" in body
+                or "forecast_s" in body
             ):
                 self._control_bed()
             return self.status()
@@ -1058,25 +1086,38 @@ class IncubatorController:
             return None
         return temp
 
+    def _clamp_forecast_s(self, raw: Any) -> int:
+        try:
+            seconds = int(round(float(raw)))
+        except (TypeError, ValueError):
+            seconds = int(AIR_LOOKAHEAD_S)
+        return max(FORECAST_MIN_S, min(FORECAST_MAX_S, seconds))
+
     def _reset_air_trend(self) -> None:
         """Caller holds self.lock."""
         self._air_hist.clear()
         self._air_wall.clear()
         self._air_rate = 0.0
+        self._air_rate_ready = False
 
     def _recompute_air_rate(self) -> None:
-        """Caller holds self.lock."""
+        """Caller holds self.lock. Pente sur la durée réglée."""
+        self._air_rate = 0.0
+        self._air_rate_ready = False
         if len(self._air_hist) < 2:
-            self._air_rate = 0.0
             return
-        started, first = self._air_hist[0]
         newest, last = self._air_hist[-1]
+        started, first = self._air_hist[0]
+        for stamp, temp in self._air_hist:
+            if newest - stamp <= self.forecast_s:
+                started, first = stamp, temp
+                break
         span = newest - started
         if span < AIR_RATE_MIN_SPAN_S:
-            self._air_rate = 0.0
             return
         rate = (last - first) / span
         self._air_rate = max(-AIR_RATE_MAX, min(AIR_RATE_MAX, rate))
+        self._air_rate_ready = True
 
     def _note_air(self, air: float) -> None:
         """Caller holds self.lock. Pente du BME sur la fenêtre récente."""
@@ -1084,12 +1125,18 @@ class IncubatorController:
         wall = time.time()
         self._air_hist.append((now, air))
         self._air_wall.append((wall, air))
-        cutoff = now - AIR_LOOKAHEAD_S
+        cutoff = now - AIR_HISTORY_S
         while self._air_hist and self._air_hist[0][0] < cutoff:
             self._air_hist.popleft()
-        while self._air_wall and self._air_wall[0][0] < wall - AIR_LOOKAHEAD_S:
+        while self._air_wall and self._air_wall[0][0] < wall - AIR_HISTORY_S:
             self._air_wall.popleft()
         self._recompute_air_rate()
+
+    def _air_rate_c_min(self) -> float | None:
+        """Pente °C/min, ou None tant que la fenêtre est trop courte."""
+        if not self._air_rate_ready:
+            return None
+        return round(self._air_rate * 60.0, 3)
 
     def _band_edge(self, air: float) -> float | None:
         """Bord déjà franchi, ou None si le BME est dans la plage."""
@@ -1101,7 +1148,7 @@ class IncubatorController:
 
     def _forecast_edge(self, air: float) -> tuple[float | None, float]:
         """Bord vers lequel la pente actuelle emmène le BME, et la température prévue."""
-        pred = air + self._air_rate * AIR_LOOKAHEAD_S
+        pred = air + self._air_rate * self.forecast_s
         if self._air_rate > 0 and pred - self.culture_temp_max >= AIR_FORECAST_MIN_C:
             return self.culture_temp_max, pred
         if self._air_rate < 0 and self.culture_temp_min - pred >= AIR_FORECAST_MIN_C:
@@ -1829,6 +1876,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
   .swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .swatch-dash { width: 16px; height: 0; border-radius: 0; border-top: 2px dashed currentColor; background: transparent !important; }
   .gallery {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
     gap: 8px; max-height: 260px; overflow: auto;
@@ -1861,6 +1909,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="label">Température culture</div>
         <div class="value" id="bmeTemp">—<small> °C</small></div>
         <div class="band" id="cultureTempBand"></div>
+        <div class="band" id="cultureForecast"></div>
       </div>
       <div class="kpi-card" id="kpiCultureHum">
         <div class="label">Humidité culture</div>
@@ -1900,6 +1949,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <span class="name">Max °C</span>
               <input id="tempMax" type="number" min="0" max="110" step="0.5" value="26" title="Maximum de la plage BME" />
               <button type="button" class="btn-gold btn-icon" id="btnSetRangeMax" title="Enregistrer la plage" aria-label="Enregistrer la plage"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
+            </div>
+            <div class="set-row">
+              <span class="name">Durée min</span>
+              <input id="forecastMin" type="number" min="1" max="30" step="1" value="3" title="Durée de projection de la pente, en minutes" />
+              <button type="button" class="btn-gold btn-icon" id="btnSetForecast" title="Enregistrer la durée" aria-label="Enregistrer la durée"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zM12 12a3 3 0 1 0 .002 6.002A3 3 0 0 0 12 12zM6 6h9v4H6V6z"/></svg></button>
             </div>
             <div class="set-row">
               <span class="name">Forcer plateau °C</span>
@@ -1973,6 +2027,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
             <span><i class="swatch" style="background:#e6b35a"></i>Min</span>
             <span><i class="swatch" style="background:#c4a15a"></i>Max</span>
             <span><i class="swatch" style="background:#6ec8ff"></i>Température culture</span>
+            <span style="color:#6ec8ff"><i class="swatch swatch-dash"></i>Pente</span>
             <span><i class="swatch" style="background:#ff8f6b"></i>Chambre</span>
             <span><i class="swatch" style="background:#c9a0ff"></i>Humidité culture</span>
             <span><i class="swatch" style="background:#5ee0c2"></i>Ventilation</span>
@@ -2001,6 +2056,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <div><label for="cfgTempMin">Min °C</label><input id="cfgTempMin" type="number" min="0" max="110" step="0.5" /></div>
           <div><label for="cfgTempMax">Max °C</label><input id="cfgTempMax" type="number" min="0" max="110" step="0.5" /></div>
         </div>
+      </div>
+      <div>
+        <label for="cfgForecastMin">Durée de la pente, en minutes</label>
+        <input id="cfgForecastMin" type="number" min="1" max="30" step="1" />
       </div>
       <div>
         <div class="name" style="font-weight:560;margin-bottom:6px">Plage humidité culture</div>
@@ -2136,10 +2195,24 @@ function applyStatus(s) {
   paintBand("kpiCultureTemp", b.temperature_c, s.culture_temp_min, s.culture_temp_max);
   paintBand("kpiCultureHum", b.humidity_pct, s.culture_hum_min, s.culture_hum_max);
   $("cultureTempBand").textContent = `${fmtNum(s.culture_temp_min, 1)} – ${fmtNum(s.culture_temp_max, 1)} °C`;
+  const rate = s.air_rate_c_min;
+  const horizonS = s.air_forecast_s || 180;
+  airForecast.ratePerMin = rate == null ? null : Number(rate);
+  airForecast.horizonS = horizonS;
+  if (b.temperature_c == null || rate == null) {
+    $("cultureForecast").textContent = "";
+  } else {
+    const mins = Math.max(1, Math.round(horizonS / 60));
+    const pred = Number(b.temperature_c) + Number(rate) * (horizonS / 60);
+    $("cultureForecast").textContent = `${fmtNum(rate, 2)} °C/min → ${fmtNum(pred, 1)} °C dans ${mins} min`;
+  }
+  if (chartPoints.length) drawMetricsChart(chartPoints, chartHover, chartHoverFuture);
   $("cultureHumBand").textContent = `${fmtNum(s.culture_hum_min, 0)} – ${fmtNum(s.culture_hum_max, 0)} %`;
 
   setIfIdle("tempMin", s.culture_temp_min);
   setIfIdle("tempMax", s.culture_temp_max);
+  setIfIdle("forecastMin", Math.round((s.air_forecast_s || 180) / 60));
+  setIfIdle("cfgForecastMin", Math.round((s.air_forecast_s || 180) / 60));
   setIfIdle("forceTemp", s.forced_bed_temp);
   setIfIdle("interval", s.photo_interval_s);
   setIfIdle("ventSpeed", s.vent_speed);
@@ -2206,6 +2279,8 @@ $("btnMetrics").onclick = async () => {
 let chartWindow = "60m";
 let chartPoints = [];
 let chartHover = -1;
+let chartHoverFuture = null;
+let airForecast = { ratePerMin: null, horizonS: 180 };
 const SERIES = [
   { key: "bed_actual_c", color: "#3ddc97", axis: "temp", label: "Plateau", digits: 2, unit: "°C" },
   { key: "culture_min_c", color: "#e6b35a", axis: "temp", label: "Min", digits: 1, unit: "°C", dash: true },
@@ -2226,7 +2301,14 @@ function niceRange(min, max, pad = 0.08) {
   return { min: min - span * pad, max: max + span * pad };
 }
 
-function chartGeom(canvas, n) {
+function futureSpanMs(spanMs) {
+  const control = (airForecast.horizonS || 180) * 1000;
+  const room = spanMs * 0.25;
+  return Math.max(control, Math.min(15 * 60 * 1000, room));
+}
+
+function chartGeom(canvas, points) {
+  const n = points.length;
   const cssW = canvas.clientWidth || 1100;
   const cssH = canvas.clientHeight || 320;
   const laneH = 12;
@@ -2234,16 +2316,22 @@ function chartGeom(canvas, n) {
   const pad = { l: 48, r: 44, t: 16, b: 22 + LANES.length * (laneH + laneGap) };
   const w = cssW - pad.l - pad.r;
   const h = cssH - pad.t - pad.b;
-  const xAt = (i) => pad.l + (n <= 1 ? w / 2 : (i / (n - 1)) * w);
-  return { cssW, cssH, laneH, laneGap, pad, w, h, xAt };
+  const t0 = n ? points[0].t : 0;
+  const t1 = n ? points[n - 1].t : 0;
+  const span = Math.max(t1 - t0, 60 * 1000);
+  const futureMs = n ? futureSpanMs(span) : 0;
+  const total = span + futureMs;
+  const xAtTime = (t) => pad.l + ((t - t0) / total) * w;
+  const xAt = (i) => (n ? xAtTime(points[Math.max(0, Math.min(n - 1, i))].t) : pad.l);
+  return { cssW, cssH, laneH, laneGap, pad, w, h, xAt, xAtTime, t0, t1, futureMs, total };
 }
 
-function drawMetricsChart(points, hoverIdx = -1) {
+function drawMetricsChart(points, hoverIdx = -1, hoverFuture = null) {
   const canvas = $("metricsChart");
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
-  const g = chartGeom(canvas, points.length);
-  const { cssW, cssH, laneH, laneGap, pad, w, h, xAt } = g;
+  const g = chartGeom(canvas, points);
+  const { cssW, cssH, laneH, laneGap, pad, w, h, xAt, xAtTime, t1, futureMs } = g;
   canvas.width = Math.round(cssW * dpr);
   canvas.height = Math.round(cssH * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -2260,6 +2348,20 @@ function drawMetricsChart(points, hoverIdx = -1) {
     return;
   }
 
+  let slope = null;
+  if (airForecast.ratePerMin != null) {
+    for (let i = points.length - 1; i >= 0; i--) {
+      if (points[i].air_c != null) {
+        slope = {
+          t: points[i].t,
+          v0: points[i].air_c,
+          v1: points[i].air_c + airForecast.ratePerMin * (futureMs / 60000),
+        };
+        break;
+      }
+    }
+  }
+
   const temps = [];
   const hums = [];
   for (const p of points) {
@@ -2269,6 +2371,7 @@ function drawMetricsChart(points, hoverIdx = -1) {
       (s.axis === "temp" ? temps : hums).push(v);
     }
   }
+  if (slope) temps.push(slope.v0, slope.v1);
   const tR = niceRange(Math.min(...temps, 15), Math.max(...temps, 30));
   const hR = niceRange(Math.min(...hums, 0), Math.max(...hums, 100));
   const yTemp = (v) => pad.t + (1 - (v - tR.min) / (tR.max - tR.min)) * h;
@@ -2303,6 +2406,12 @@ function drawMetricsChart(points, hoverIdx = -1) {
     else ctx.textAlign = "center";
     ctx.fillText(label, xAt(i), pad.t + h + 13);
   }
+  if (futureMs > 0 && futureMs > (t1 - points[0].t) * 0.08) {
+    const end = new Date(t1 + futureMs);
+    const ahead = end.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+    ctx.textAlign = "right";
+    ctx.fillText(ahead, pad.l + w, pad.t + h + 13);
+  }
 
   for (const s of SERIES) {
     ctx.beginPath();
@@ -2320,6 +2429,40 @@ function drawMetricsChart(points, hoverIdx = -1) {
     ctx.setLineDash(s.dash ? [5, 4] : []);
     ctx.stroke();
     ctx.setLineDash([]);
+  }
+
+  const nowX = xAtTime(t1);
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,.28)";
+  ctx.setLineDash([2, 3]);
+  ctx.beginPath();
+  ctx.moveTo(nowX, pad.t);
+  ctx.lineTo(nowX, pad.t + h);
+  ctx.stroke();
+  ctx.restore();
+
+  if (slope) {
+    const x0 = xAtTime(slope.t);
+    const x1 = xAtTime(slope.t + futureMs);
+    ctx.beginPath();
+    ctx.moveTo(x0, yTemp(slope.v0));
+    ctx.lineTo(x1, yTemp(slope.v1));
+    ctx.strokeStyle = "#6ec8ff";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([2, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const mark = Math.min((airForecast.horizonS || 180) * 1000, futureMs);
+    const pred = slope.v0 + airForecast.ratePerMin * (mark / 60000);
+    const xm = xAtTime(slope.t + mark);
+    const ym = yTemp(pred);
+    ctx.fillStyle = "#6ec8ff";
+    ctx.beginPath();
+    ctx.arc(xm, ym, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = "11px Outfit, system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(`${pred.toFixed(1)} °C`, Math.min(xm + 6, pad.l + w - 46), ym - 6);
   }
 
   LANES.forEach((lane, row) => {
@@ -2348,7 +2491,26 @@ function drawMetricsChart(points, hoverIdx = -1) {
     ctx.fillText(lane.label, pad.l - 6, y + laneH - 2);
   });
 
-  if (hoverIdx >= 0 && hoverIdx < points.length) {
+  if (hoverFuture != null) {
+    const x = xAtTime(hoverFuture);
+    ctx.save();
+    ctx.strokeStyle = "rgba(110,200,255,.7)";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, pad.t);
+    ctx.lineTo(x, pad.t + h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (slope) {
+      const pred = slope.v0 + airForecast.ratePerMin * ((hoverFuture - slope.t) / 60000);
+      const y = yTemp(pred);
+      ctx.beginPath();
+      ctx.fillStyle = "#6ec8ff";
+      ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  } else if (hoverIdx >= 0 && hoverIdx < points.length) {
     const x = xAt(hoverIdx);
     ctx.save();
     ctx.strokeStyle = "rgba(255,255,255,.4)";
@@ -2371,41 +2533,65 @@ function drawMetricsChart(points, hoverIdx = -1) {
   }
 }
 
-function chartIndexAt(clientX) {
+function chartPointer(clientX) {
   const n = chartPoints.length;
-  if (!n) return -1;
+  if (!n) return { idx: -1, futureT: null };
   const canvas = $("metricsChart");
   const rect = canvas.getBoundingClientRect();
   const x = clientX - rect.left;
-  const g = chartGeom(canvas, n);
-  if (x < g.pad.l || x > g.pad.l + g.w) return -1;
-  if (n === 1) return 0;
-  return Math.max(0, Math.min(n - 1, Math.round(((x - g.pad.l) / g.w) * (n - 1))));
+  const g = chartGeom(canvas, chartPoints);
+  if (x < g.pad.l || x > g.pad.l + g.w) return { idx: -1, futureT: null };
+  const t = g.t0 + ((x - g.pad.l) / g.w) * g.total;
+  if (t > g.t1 + 1500) return { idx: -1, futureT: t };
+  let best = 0;
+  let bestD = Infinity;
+  for (let i = 0; i < n; i++) {
+    const d = Math.abs(chartPoints[i].t - t);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return { idx: best, futureT: null };
 }
 
-function showChartTip(idx, clientX, clientY) {
+function showChartTip(idx, futureT, clientX, clientY) {
   const tip = $("chartTip");
-  if (idx < 0 || !chartPoints[idx]) {
+  let html = "";
+  if (futureT != null && airForecast.ratePerMin != null) {
+    let base = null;
+    let baseT = null;
+    for (let i = chartPoints.length - 1; i >= 0; i--) {
+      if (chartPoints[i].air_c != null) {
+        base = chartPoints[i].air_c;
+        baseT = chartPoints[i].t;
+        break;
+      }
+    }
+    if (base == null) { tip.classList.remove("show"); return; }
+    const mins = Math.max(0, (futureT - baseT) / 60000);
+    const pred = base + airForecast.ratePerMin * mins;
+    html = `<div class="when">Dans ${Math.round(mins)} min · si la pente continue</div><div class="row"><span><i class="dot" style="background:#6ec8ff"></i>Température culture</span><b>${fmtNum(pred, 2)} °C</b></div>`;
+  } else if (idx < 0 || !chartPoints[idx]) {
     tip.classList.remove("show");
     return;
+  } else {
+    const p = chartPoints[idx];
+    const when = new Date(p.t).toLocaleString("fr-FR", {
+      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+    const rows = [
+      ...SERIES.map((s) => {
+        const v = p[s.key];
+        const text = v == null ? "—" : `${Number(v).toFixed(s.digits)} ${s.unit}`;
+        return `<div class="row"><span><i class="dot" style="background:${s.color}"></i>${s.label}</span><b>${text}</b></div>`;
+      }),
+      ...LANES.map((lane) => {
+        const v = p[lane.key];
+        const text = v == null ? "—" : (v >= 0.5 ? "ON" : "OFF");
+        return `<div class="row"><span><i class="dot" style="background:${lane.swatch}"></i>${lane.tip}</span><b>${text}</b></div>`;
+      }),
+    ].join("");
+    html = `<div class="when">${when}</div>${rows}`;
   }
-  const p = chartPoints[idx];
-  const when = new Date(p.t).toLocaleString("fr-FR", {
-    day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
-  const rows = [
-    ...SERIES.map((s) => {
-      const v = p[s.key];
-      const text = v == null ? "—" : `${Number(v).toFixed(s.digits)} ${s.unit}`;
-      return `<div class="row"><span><i class="dot" style="background:${s.color}"></i>${s.label}</span><b>${text}</b></div>`;
-    }),
-    ...LANES.map((lane) => {
-      const v = p[lane.key];
-      const text = v == null ? "—" : (v >= 0.5 ? "ON" : "OFF");
-      return `<div class="row"><span><i class="dot" style="background:${lane.swatch}"></i>${lane.tip}</span><b>${text}</b></div>`;
-    }),
-  ].join("");
-  tip.innerHTML = `<div class="when">${when}</div>${rows}`;
+  tip.innerHTML = html;
   tip.classList.add("show");
   const wrap = tip.parentElement;
   const bounds = wrap.getBoundingClientRect();
@@ -2422,8 +2608,9 @@ async function refreshChart() {
     const data = await api("/api/metrics?window=" + encodeURIComponent(chartWindow));
     chartPoints = data.points || [];
     chartHover = -1;
+    chartHoverFuture = null;
     $("chartTip").classList.remove("show");
-    drawMetricsChart(chartPoints, -1);
+    drawMetricsChart(chartPoints, -1, null);
     $("chartMeta").textContent = data.count
       ? `${data.count} point${data.count > 1 ? "s" : ""}`
       : "Aucune donnée";
@@ -2444,17 +2631,19 @@ $("chartWindow").onclick = (ev) => {
 window.addEventListener("resize", () => refreshChart());
 
 $("metricsChart").addEventListener("pointermove", (ev) => {
-  const idx = chartIndexAt(ev.clientX);
-  if (idx !== chartHover) {
-    chartHover = idx;
-    drawMetricsChart(chartPoints, idx);
+  const hit = chartPointer(ev.clientX);
+  if (hit.idx !== chartHover || hit.futureT !== chartHoverFuture) {
+    chartHover = hit.idx;
+    chartHoverFuture = hit.futureT;
+    drawMetricsChart(chartPoints, chartHover, chartHoverFuture);
   }
-  showChartTip(idx, ev.clientX, ev.clientY);
+  showChartTip(hit.idx, hit.futureT, ev.clientX, ev.clientY);
 });
 $("metricsChart").addEventListener("pointerleave", () => {
-  if (chartHover !== -1) {
+  if (chartHover !== -1 || chartHoverFuture != null) {
     chartHover = -1;
-    drawMetricsChart(chartPoints, -1);
+    chartHoverFuture = null;
+    drawMetricsChart(chartPoints, -1, null);
   }
   $("chartTip").classList.remove("show");
 });
@@ -2493,6 +2682,13 @@ async function saveTempRange() {
 }
 $("btnSetRangeMin").onclick = () => saveTempRange();
 $("btnSetRangeMax").onclick = () => saveTempRange();
+$("btnSetForecast").onclick = async () => {
+  await api("/api/settings", {
+    method: "POST",
+    body: JSON.stringify({ forecast_min: clampInput("forecastMin") }),
+  });
+  refreshStatus();
+};
 $("btnForce").onclick = async () => {
   await api("/api/heater", {
     method: "POST",
@@ -2552,6 +2748,7 @@ $("cfgForm").onsubmit = async (ev) => {
         culture_temp_max: Number($("cfgTempMax").value),
         culture_hum_min: Number($("cfgHumMin").value),
         culture_hum_max: Number($("cfgHumMax").value),
+        forecast_min: Number($("cfgForecastMin").value),
         camera_url: $("cameraUrl").value,
         sun_lat: Number($("sunLat").value),
         sun_lon: Number($("sunLon").value),
