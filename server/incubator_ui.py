@@ -97,6 +97,8 @@ SUN_UP_ELEVATION_DEG = -0.833
 # Asservissement plateau ← température BME (incubateur allumé, sans forçage).
 AIR_KP = 2.0
 AIR_KI = 0.004
+# L'air suit le plateau avec du retard. On double l'écart demandé au-dessus du milieu.
+BED_INERTIA = 2.0
 AIR_DEADBAND_C = 0.3
 AIR_SANE_MIN = 5.0
 AIR_SANE_MAX = 70.0
@@ -1179,6 +1181,11 @@ class IncubatorController:
         """Milieu de la plage : température d'air visée."""
         return (float(self.culture_temp_min) + float(self.culture_temp_max)) / 2.0
 
+    def _bed_with_inertia(self, center: float, bed: float) -> float:
+        """Le plateau doit monter deux fois plus que l'écart d'air, à cause de l'inertie."""
+        bed = center + BED_INERTIA * (float(bed) - center)
+        return round(max(BED_AUTO_MIN, min(BED_AUTO_MAX, bed)), 1)
+
     def _air_sense(self, air: float) -> tuple[float, bool]:
         """Température pilotée. La pente, quand elle est connue, anticipe sur la durée réglée."""
         if not self._air_rate_ready:
@@ -1190,8 +1197,9 @@ class IncubatorController:
         air = self._air_c()
         if air is None or air >= self._culture_mid():
             return 0.0
-        bed, _integral = air_bed_command(self._culture_mid(), air, 0.0, 0.0)
-        return bed
+        center = self._culture_mid()
+        bed, _integral = air_bed_command(center, air, 0.0, 0.0)
+        return self._bed_with_inertia(center, bed)
 
     def _control_bed(self) -> None:
         """Caller holds self.lock. Ramène le BME vers le milieu de la plage."""
@@ -1228,6 +1236,7 @@ class IncubatorController:
             dt = min(30.0, max(0.5, now - self._heat_tick_at))
         self._heat_tick_at = now
         bed, self._heat_i = air_bed_command(center, sense, self._heat_i, dt)
+        bed = self._bed_with_inertia(center, bed)
         if air >= self.culture_temp_max and self._bed_command is not None:
             bed = min(bed, self._bed_command)
         actual = None if self.bed_actual is None else float(self.bed_actual)
@@ -2013,7 +2022,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <button type="button" class="btn-ghost" id="btnStopKeep">Pause</button>
                 <button type="button" class="btn-danger" id="btnOff">Éteindre</button>
               </div>
-              <p class="hint">La plage min–max est la consigne du BME. Le plateau vise le milieu. Sous le minimum, il chauffe tout de suite. Vers le maximum, il baisse avant de l'atteindre. Au-delà, la ventilation reste allumée. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
+              <p class="hint">La plage min–max est la consigne du BME. Le plateau vise le milieu, avec le double d'écart pour son inertie. Sous le minimum, il chauffe tout de suite. Vers le maximum, il baisse avant de l'atteindre. Au-delà, la ventilation reste allumée. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
               <button type="button" class="btn-ghost" id="btnHeatAuto" hidden>Reprendre la plage</button>
             </div>
           </div>
