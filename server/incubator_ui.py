@@ -1228,7 +1228,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: relative; width: 100%; height: 320px; margin-top: 10px;
     border-radius: 12px; background: rgba(255,255,255,.03); border: 1px solid var(--line);
   }
-  .chart-wrap canvas { width: 100%; height: 100%; display: block; }
+  .chart-wrap canvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+  .chart-tip {
+    position: absolute; z-index: 3; display: none; pointer-events: none;
+    min-width: 180px; padding: 8px 10px; border-radius: 10px;
+    background: rgba(16, 22, 28, .94); border: 1px solid var(--line);
+    font-size: .75rem; line-height: 1.4; color: var(--text);
+  }
+  .chart-tip.show { display: block; }
+  .chart-tip .when { color: var(--muted); margin-bottom: 4px; }
+  .chart-tip .row { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+  .chart-tip .row b { font-weight: 560; font-variant-numeric: tabular-nums; }
+  .chart-tip .dot { width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; display: inline-block; }
   .chart-legend {
     display: flex; flex-wrap: wrap; gap: 12px 16px; margin-top: 10px;
     font-size: .78rem; color: var(--muted);
@@ -1359,7 +1370,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
             </div>
             <button type="button" class="btn-ghost" id="btnMetrics">Télécharger CSV</button>
           </div>
-          <div class="chart-wrap"><canvas id="metricsChart" width="1100" height="320"></canvas></div>
+          <div class="chart-wrap">
+            <canvas id="metricsChart" width="1100" height="320"></canvas>
+            <div id="chartTip" class="chart-tip" role="tooltip"></div>
+          </div>
           <div class="chart-legend">
             <span><i class="swatch" style="background:#3ddc97"></i>Plateau</span>
             <span><i class="swatch" style="background:#e6b35a"></i>Consigne</span>
@@ -1583,16 +1597,18 @@ $("btnMetrics").onclick = async () => {
 };
 
 let chartWindow = "60m";
+let chartPoints = [];
+let chartHover = -1;
 const SERIES = [
-  { key: "bed_actual_c", color: "#3ddc97", axis: "temp" },
-  { key: "consigne_c", color: "#e6b35a", axis: "temp" },
-  { key: "air_c", color: "#6ec8ff", axis: "temp" },
-  { key: "chamber_c", color: "#ff8f6b", axis: "temp" },
-  { key: "humidity_pct", color: "#c9a0ff", axis: "hum" },
+  { key: "bed_actual_c", color: "#3ddc97", axis: "temp", label: "Plateau", digits: 2, unit: "°C" },
+  { key: "consigne_c", color: "#e6b35a", axis: "temp", label: "Consigne", digits: 2, unit: "°C" },
+  { key: "air_c", color: "#6ec8ff", axis: "temp", label: "Température culture", digits: 2, unit: "°C" },
+  { key: "chamber_c", color: "#ff8f6b", axis: "temp", label: "Chambre", digits: 2, unit: "°C" },
+  { key: "humidity_pct", color: "#c9a0ff", axis: "hum", label: "Humidité culture", digits: 1, unit: "%" },
 ];
 const LANES = [
-  { key: "vent_on", color: "rgba(94, 224, 194, .9)", label: "Vent" },
-  { key: "light_on", color: "rgba(255, 208, 122, .95)", label: "Flash" },
+  { key: "vent_on", color: "rgba(94, 224, 194, .9)", label: "Vent", tip: "Ventilation", swatch: "#5ee0c2" },
+  { key: "light_on", color: "rgba(255, 208, 122, .95)", label: "Flash", tip: "Flash", swatch: "#ffd07a" },
 ];
 
 function niceRange(min, max, pad = 0.08) {
@@ -1602,22 +1618,28 @@ function niceRange(min, max, pad = 0.08) {
   return { min: min - span * pad, max: max + span * pad };
 }
 
-function drawMetricsChart(points) {
-  const canvas = $("metricsChart");
-  const ctx = canvas.getContext("2d");
-  const dpr = window.devicePixelRatio || 1;
+function chartGeom(canvas, n) {
   const cssW = canvas.clientWidth || 1100;
   const cssH = canvas.clientHeight || 320;
-  canvas.width = Math.round(cssW * dpr);
-  canvas.height = Math.round(cssH * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, cssW, cssH);
-
   const laneH = 12;
   const laneGap = 4;
   const pad = { l: 48, r: 44, t: 16, b: 22 + LANES.length * (laneH + laneGap) };
   const w = cssW - pad.l - pad.r;
   const h = cssH - pad.t - pad.b;
+  const xAt = (i) => pad.l + (n <= 1 ? w / 2 : (i / (n - 1)) * w);
+  return { cssW, cssH, laneH, laneGap, pad, w, h, xAt };
+}
+
+function drawMetricsChart(points, hoverIdx = -1) {
+  const canvas = $("metricsChart");
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const g = chartGeom(canvas, points.length);
+  const { cssW, cssH, laneH, laneGap, pad, w, h, xAt } = g;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
 
   ctx.fillStyle = "rgba(255,255,255,.03)";
   ctx.fillRect(0, 0, cssW, cssH);
@@ -1641,7 +1663,6 @@ function drawMetricsChart(points) {
   }
   const tR = niceRange(Math.min(...temps, 15), Math.max(...temps, 30));
   const hR = niceRange(Math.min(...hums, 0), Math.max(...hums, 100));
-  const xAt = (i) => pad.l + (points.length === 1 ? w / 2 : (i / (points.length - 1)) * w);
   const yTemp = (v) => pad.t + (1 - (v - tR.min) / (tR.max - tR.min)) * h;
   const yHum = (v) => pad.t + (1 - (v - hR.min) / (hR.max - hR.min)) * h;
 
@@ -1718,12 +1739,83 @@ function drawMetricsChart(points) {
     ctx.font = "10px Outfit, system-ui, sans-serif";
     ctx.fillText(lane.label, pad.l - 6, y + laneH - 2);
   });
+
+  if (hoverIdx >= 0 && hoverIdx < points.length) {
+    const x = xAt(hoverIdx);
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,255,255,.4)";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, pad.t);
+    ctx.lineTo(x, pad.t + h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    for (const s of SERIES) {
+      const v = points[hoverIdx][s.key];
+      if (v == null) continue;
+      const y = s.axis === "temp" ? yTemp(v) : yHum(v);
+      ctx.beginPath();
+      ctx.fillStyle = s.color;
+      ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+function chartIndexAt(clientX) {
+  const n = chartPoints.length;
+  if (!n) return -1;
+  const canvas = $("metricsChart");
+  const rect = canvas.getBoundingClientRect();
+  const x = clientX - rect.left;
+  const g = chartGeom(canvas, n);
+  if (x < g.pad.l || x > g.pad.l + g.w) return -1;
+  if (n === 1) return 0;
+  return Math.max(0, Math.min(n - 1, Math.round(((x - g.pad.l) / g.w) * (n - 1))));
+}
+
+function showChartTip(idx, clientX, clientY) {
+  const tip = $("chartTip");
+  if (idx < 0 || !chartPoints[idx]) {
+    tip.classList.remove("show");
+    return;
+  }
+  const p = chartPoints[idx];
+  const when = new Date(p.t).toLocaleString("fr-FR", {
+    day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const rows = [
+    ...SERIES.map((s) => {
+      const v = p[s.key];
+      const text = v == null ? "—" : `${Number(v).toFixed(s.digits)} ${s.unit}`;
+      return `<div class="row"><span><i class="dot" style="background:${s.color}"></i>${s.label}</span><b>${text}</b></div>`;
+    }),
+    ...LANES.map((lane) => {
+      const v = p[lane.key];
+      const text = v == null ? "—" : (v >= 0.5 ? "ON" : "OFF");
+      return `<div class="row"><span><i class="dot" style="background:${lane.swatch}"></i>${lane.tip}</span><b>${text}</b></div>`;
+    }),
+  ].join("");
+  tip.innerHTML = `<div class="when">${when}</div>${rows}`;
+  tip.classList.add("show");
+  const wrap = tip.parentElement;
+  const bounds = wrap.getBoundingClientRect();
+  let left = clientX - bounds.left + 14;
+  let top = clientY - bounds.top + 14;
+  if (left + tip.offsetWidth > bounds.width - 8) left = clientX - bounds.left - tip.offsetWidth - 14;
+  if (top + tip.offsetHeight > bounds.height - 8) top = Math.max(8, bounds.height - tip.offsetHeight - 8);
+  tip.style.left = `${Math.max(8, left)}px`;
+  tip.style.top = `${Math.max(8, top)}px`;
 }
 
 async function refreshChart() {
   try {
     const data = await api("/api/metrics?window=" + encodeURIComponent(chartWindow));
-    drawMetricsChart(data.points || []);
+    chartPoints = data.points || [];
+    chartHover = -1;
+    $("chartTip").classList.remove("show");
+    drawMetricsChart(chartPoints, -1);
     $("chartMeta").textContent = data.count
       ? `${data.count} point${data.count > 1 ? "s" : ""}`
       : "Aucune donnée";
@@ -1742,6 +1834,22 @@ $("chartWindow").onclick = (ev) => {
   refreshChart();
 };
 window.addEventListener("resize", () => refreshChart());
+
+$("metricsChart").addEventListener("pointermove", (ev) => {
+  const idx = chartIndexAt(ev.clientX);
+  if (idx !== chartHover) {
+    chartHover = idx;
+    drawMetricsChart(chartPoints, idx);
+  }
+  showChartTip(idx, ev.clientX, ev.clientY);
+});
+$("metricsChart").addEventListener("pointerleave", () => {
+  if (chartHover !== -1) {
+    chartHover = -1;
+    drawMetricsChart(chartPoints, -1);
+  }
+  $("chartTip").classList.remove("show");
+});
 
 function bumpCam() {
   $("cam").src = "/api/camera.jpg?t=" + Date.now();
