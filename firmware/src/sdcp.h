@@ -11,6 +11,8 @@ struct PrinterState {
   float bed_actual = NAN;
   float bed_target = NAN;
   float nozzle_actual = NAN;
+  float chamber_c = NAN;
+  float chamber_target_c = NAN;
   bool light_on = false;
   int box_fan = 0;
 };

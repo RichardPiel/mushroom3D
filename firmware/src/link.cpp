@@ -75,6 +75,8 @@ LinkResult ServerLink::postTelemetry(const PrinterState &printer, const BmeReadi
   putFloat(p, "bed_actual", printer.bed_actual);
   putFloat(p, "bed_target", printer.bed_target);
   putFloat(p, "nozzle_actual", printer.nozzle_actual);
+  putFloat(p, "chamber_c", printer.chamber_c);
+  putFloat(p, "chamber_target_c", printer.chamber_target_c);
   p["light_on"] = printer.light_on;
   p["box_fan"] = printer.box_fan;
   p["camera_url"] = camera_url;

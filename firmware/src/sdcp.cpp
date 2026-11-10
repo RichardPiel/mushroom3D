@@ -250,6 +250,12 @@ bool SdcpClient::readTemperatures() {
     if (!status["TempOfNozzle"].isNull()) {
       state_.nozzle_actual = status["TempOfNozzle"].as<float>();
     }
+    if (!status["TempOfBox"].isNull()) {
+      state_.chamber_c = status["TempOfBox"].as<float>();
+    }
+    if (!status["TempTargetBox"].isNull()) {
+      state_.chamber_target_c = status["TempTargetBox"].as<float>();
+    }
     JsonObject fans = status["CurrentFanSpeed"].as<JsonObject>();
     if (!fans.isNull() && !fans["BoxFan"].isNull()) {
       state_.box_fan = fans["BoxFan"].as<int>();

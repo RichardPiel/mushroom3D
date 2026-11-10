@@ -56,6 +56,7 @@ METRICS_FIELDS = (
     "vent_speed_pct",
     "vent_actual_pct",
     "air_c",
+    "chamber_c",
     "humidity_pct",
     "light_on",
     "photo",
@@ -65,7 +66,7 @@ METRICS_WINDOWS = {
     "60m": 60 * 60,
     "24h": 24 * 60 * 60,
 }
-METRICS_SERIES = ("bed_actual_c", "consigne_c", "air_c", "humidity_pct")
+METRICS_SERIES = ("bed_actual_c", "consigne_c", "air_c", "chamber_c", "humidity_pct")
 METRICS_FLAGS = ("vent_on", "light_on")
 
 AUTH_PASSWORD = os.environ.get("INCUBATOR_PASSWORD", "")
@@ -350,6 +351,8 @@ class IncubatorController:
         self.bed_actual: float | None = None
         self.bed_target: float | None = None
         self.nozzle_actual: float | None = None
+        self.chamber_c: float | None = None
+        self.chamber_target_c: float | None = None
         self.last_photo: str | None = None
         self.photo_count = 0
         self.started_at: float | None = None
@@ -416,6 +419,7 @@ class IncubatorController:
                     if self.bme680.get("temperature_c") is None
                     else f"{float(self.bme680['temperature_c']):.2f}"
                 ),
+                "chamber_c": "" if self.chamber_c is None else f"{self.chamber_c:.2f}",
                 "humidity_pct": (
                     ""
                     if self.bme680.get("humidity_pct") is None
@@ -473,6 +477,8 @@ class IncubatorController:
                 "bed_actual": self.bed_actual,
                 "bed_target": self.bed_target,
                 "nozzle_actual": self.nozzle_actual,
+                "chamber_c": self.chamber_c,
+                "chamber_target_c": self.chamber_target_c,
                 "last_photo": self.last_photo,
                 "photo_count": self.photo_count,
                 "metrics_csv": "/api/metrics.csv",
@@ -516,6 +522,10 @@ class IncubatorController:
                 self.bed_target = float(printer["bed_target"])
             if printer.get("nozzle_actual") is not None:
                 self.nozzle_actual = float(printer["nozzle_actual"])
+            if printer.get("chamber_c") is not None:
+                self.chamber_c = float(printer["chamber_c"])
+            if printer.get("chamber_target_c") is not None:
+                self.chamber_target_c = float(printer["chamber_target_c"])
             if "light_on" in printer:
                 self.light_on = bool(printer["light_on"])
             if printer.get("box_fan") is not None:
@@ -1071,6 +1081,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <div class="value" id="photoCount">0</div>
             </div>
             <div class="stat">
+              <div class="label">Chambre</div>
+              <div class="value" id="chamberTemp">—<small> °C</small></div>
+            </div>
+            <div class="stat">
               <div class="label">Air box</div>
               <div class="value" id="ventActual">—<small> %</small></div>
             </div>
@@ -1183,6 +1197,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <span><i class="swatch" style="background:#3ddc97"></i>Plateau</span>
           <span><i class="swatch" style="background:#e6b35a"></i>Consigne</span>
           <span><i class="swatch" style="background:#6ec8ff"></i>Air BME</span>
+          <span><i class="swatch" style="background:#ff8f6b"></i>Chambre</span>
           <span><i class="swatch" style="background:#c9a0ff"></i>Humidité %</span>
           <span><i class="swatch" style="background:#5ee0c2"></i>Ventilation</span>
           <span><i class="swatch" style="background:#ffd07a"></i>Flash</span>
@@ -1261,6 +1276,7 @@ function applyStatus(s) {
   $("bedTarget").innerHTML = (s.target_temp ?? "—") + "<small> °C</small>";
   $("photoCount").textContent = s.photo_count ?? 0;
   $("ventActual").innerHTML = (s.vent_actual != null ? Math.round(s.vent_actual) : "—") + "<small> %</small>";
+  $("chamberTemp").innerHTML = fmtNum(s.chamber_c) + "<small> °C</small>";
 
   const b = s.bme680 || {};
   $("bmeTemp").innerHTML = fmtNum(b.temperature_c) + "<small> °C</small>";
@@ -1359,6 +1375,7 @@ const SERIES = [
   { key: "bed_actual_c", color: "#3ddc97", axis: "temp" },
   { key: "consigne_c", color: "#e6b35a", axis: "temp" },
   { key: "air_c", color: "#6ec8ff", axis: "temp" },
+  { key: "chamber_c", color: "#ff8f6b", axis: "temp" },
   { key: "humidity_pct", color: "#c9a0ff", axis: "hum" },
 ];
 const LANES = [
