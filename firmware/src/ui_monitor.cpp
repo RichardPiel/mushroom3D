@@ -112,7 +112,11 @@ void paintValues(const PrinterState &printer, const BmeReading &bme, bool link_o
   // Plateau
   fillCard(8, 40, 148, 88);
   drawLabel(16, 48, "PLATEAU");
-  fmt1(buf, sizeof(buf), printer.bed_actual, "");
+  if (isnan(printer.bed_actual)) {
+    snprintf(buf, sizeof(buf), "—");
+  } else {
+    snprintf(buf, sizeof(buf), "%.2f", printer.bed_actual);
+  }
   drawBig(16, 68, buf, COL_TEXT);
   tft.setTextColor(COL_MUTED, COL_CARD);
   tft.setTextSize(2);
@@ -174,7 +178,7 @@ void uiUpdate(const PrinterState &printer, const BmeReading &bme, bool link_ok, 
       cache.drawn && cache.link == link_ok && cache.printer == printer.connected &&
       cache.heater == heater &&
       (isnan(cache.bed) ? isnan(printer.bed_actual)
-                        : fabsf(cache.bed - printer.bed_actual) < 0.05f) &&
+                        : fabsf(cache.bed - printer.bed_actual) < 0.005f) &&
       (isnan(cache.target) ? isnan(target_temp) : fabsf(cache.target - target_temp) < 0.05f) &&
       (isnan(cache.hum) ? isnan(bme.humidity_pct)
                         : fabsf(cache.hum - bme.humidity_pct) < 0.5f) &&

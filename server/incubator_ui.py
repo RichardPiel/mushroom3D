@@ -1716,7 +1716,7 @@ function applyStatus(s) {
     ? `Relais · ${fmtRemain(s.link.age_s)}`
     : (s.relay_configured ? "Relais hors ligne" : "RELAY_TOKEN manquant");
 
-  $("bedActual").innerHTML = (s.bed_actual ?? "—") + "<small> °C</small>";
+  $("bedActual").innerHTML = fmtNum(s.bed_actual, 2) + "<small> °C</small>";
   const bedOrder = s.bed_command != null ? s.bed_command : s.bed_target;
   $("bedCmd").textContent = s.heat_forced
     ? `forcé ${fmtNum(bedOrder, 1)} °C`
