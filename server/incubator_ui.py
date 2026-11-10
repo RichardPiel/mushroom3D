@@ -98,6 +98,8 @@ AIR_SANE_MAX = 70.0
 BED_AUTO_MIN = 0.0
 BED_AUTO_MAX = 60.0
 BED_SLEW_C = 2.0
+COOL_ON_C = 0.5
+COOL_OFF_C = 0.1
 HEAT_I_MAX = 12.0 / AIR_KI
 HEAT_I_MIN = -15.0 / AIR_KI
 
@@ -375,6 +377,7 @@ class IncubatorController:
         self._heat_tick_at = 0.0
         self._bed_command: float | None = None
         self._air_sane = True
+        self._cool_vent = False
         self.photo_interval_s = _cfg_int(cfg, "photo_interval_s", DEFAULT_PHOTO_INTERVAL_S)
         if not (10 <= self.photo_interval_s <= 86400):
             self.photo_interval_s = int(DEFAULT_PHOTO_INTERVAL_S)
@@ -531,6 +534,7 @@ class IncubatorController:
                 "sun_up": self.sun_elevation >= SUN_UP_ELEVATION_DEG,
                 "vent_mode": self.vent_mode,
                 "vent_on": self.vent_on,
+                "cool_vent": self._cool_vent,
                 "vent_speed": self.vent_speed,
                 "vent_actual": self.vent_actual,
                 "vent_interval_s": self.vent_interval_s,
@@ -786,23 +790,27 @@ class IncubatorController:
 
     def _control_bed(self) -> None:
         """Caller holds self.lock. Ajuste le plateau d'après le BME."""
-        if not self.incubator_running or self.heat_forced:
+        if not self.incubator_running:
+            self._cool_vent = False
             return
         air = self._air_c()
         if air is None:
-            if self._air_sane:
+            if not self.heat_forced and self._air_sane:
                 log.warning(
                     "BME indisponible (%s) — plateau non modifié",
                     self.bme680.get("temperature_c"),
                 )
                 self._air_sane = False
             return
+        self._air_sane = True
+        self._sync_cool_vent(air)
+        if self.heat_forced:
+            return
         now = time.monotonic()
         if self._heat_tick_at <= 0:
             dt = 5.0
         else:
             dt = min(30.0, max(0.5, now - self._heat_tick_at))
-        self._air_sane = True
         self._heat_tick_at = now
         bed, self._heat_i = air_bed_command(self.target_temp, air, self._heat_i, dt)
         if self._bed_command is not None:
@@ -815,6 +823,47 @@ class IncubatorController:
         log.info(
             "Plateau %.1f °C (BME %.1f °C, consigne %.1f °C)",
             bed,
+            air,
+            self.target_temp,
+        )
+
+    def _queue_vent(self, mode: str) -> None:
+        """Caller holds self.lock. Remplace un ordre d'air déjà en file."""
+        payload = {
+            "type": "vent",
+            "mode": mode,
+            "speed": self.vent_speed,
+            "interval_s": self.vent_interval_s,
+            "duration_s": self.vent_duration_s,
+        }
+        updated = False
+        for cmd in self.commands:
+            if cmd.get("type") == "vent":
+                cmd.update(payload)
+                updated = True
+        if updated:
+            self._cmd_event.set()
+            return
+        self._enqueue(payload)
+
+    def _sync_cool_vent(self, air: float) -> None:
+        """Ventilation continue tant que le BME est au-dessus de la consigne."""
+        if self.vent_mode != "cycle":
+            self._cool_vent = False
+            return
+        if self._cool_vent:
+            if air > self.target_temp + COOL_OFF_C:
+                return
+            self._cool_vent = False
+            self._queue_vent("cycle")
+            log.info("Refroidissement terminé, cycle d'air repris (BME %.1f °C)", air)
+            return
+        if air <= self.target_temp + COOL_ON_C:
+            return
+        self._cool_vent = True
+        self._queue_vent("manual")
+        log.info(
+            "Ventilation continue pour refroidir (BME %.1f °C, consigne %.1f °C)",
             air,
             self.target_temp,
         )
@@ -880,6 +929,7 @@ class IncubatorController:
             self.heater_on = False
             self.heat_forced = False
             self._heat_i = 0.0
+            self._cool_vent = False
             self.vent_mode = "off"
             self._vent_saved = True
             self.vent_on = False
@@ -913,6 +963,7 @@ class IncubatorController:
             if mode not in ("off", "manual", "cycle"):
                 self.last_error = "Mode ventilation inconnu"
                 return self.status()
+            self._cool_vent = False
             new_speed = self.vent_speed if speed is None else int(speed)
             new_interval = self.vent_interval_s if interval_s is None else max(30, int(interval_s))
             new_duration = self.vent_duration_s if duration_s is None else max(5, int(duration_s))
@@ -1030,6 +1081,7 @@ class IncubatorController:
                 self._bed_command = 0.0
             self.vent_mode = "off"
             self.vent_on = False
+            self._cool_vent = False
             self._vent_saved = True
             self.light_mode = "manual"
             self._persist_setpoints()
@@ -1470,7 +1522,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="value" id="bmeHum">—<small> %</small></div>
         <div class="band" id="cultureHumBand"></div>
       </div>
-      <div class="kpi-card"><div class="label">Air box</div><div class="value" id="ventActual">—<small> %</small></div></div>
+      <div class="kpi-card"><div class="label">Air box</div><div class="value" id="ventActual">—<small> %</small></div><div class="band" id="ventBand"></div></div>
       <div class="kpi-card"><div class="label">Photos</div><div class="value" id="photoCount">0</div></div>
     </section>
 
@@ -1537,7 +1589,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <button type="button" class="btn-ghost" id="btnStopKeep">Pause</button>
                 <button type="button" class="btn-danger" id="btnOff">Éteindre</button>
               </div>
-              <p class="hint">Démarrer asservit le plateau à la température du BME (plafond 60 °C), lance le cycle d'air et l'éclairage soleil. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
+              <p class="hint">Démarrer asservit le plateau à la température du BME (plafond 60 °C), lance le cycle d'air et l'éclairage soleil. Au-dessus de la consigne, la ventilation reste allumée pour accélérer le refroidissement. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
               <button type="button" class="btn-ghost" id="btnHeatAuto" hidden>Reprendre le BME</button>
             </div>
           </div>
@@ -1725,6 +1777,7 @@ function applyStatus(s) {
   $("chamberTemp").innerHTML = fmtNum(s.chamber_c) + "<small> °C</small>";
   $("photoCount").textContent = s.photo_count ?? 0;
   $("ventActual").innerHTML = (s.vent_actual != null ? Math.round(s.vent_actual) : "—") + "<small> %</small>";
+  $("ventBand").textContent = s.cool_vent ? "refroidissement" : "";
 
   const b = s.bme680 || {};
   $("bmeTemp").innerHTML = fmtNum(b.temperature_c) + "<small> °C</small>";
@@ -1753,8 +1806,10 @@ function applyStatus(s) {
   if (s.last_error) showErr(s.last_error);
   else showErr("");
 
+  const regime = s.heat_forced ? "plateau forcé" : "BME";
+  const cooling = s.cool_vent ? " · ventilation" : "";
   $("runState").textContent = s.incubator_running
-    ? `ON · ${s.heat_forced ? "plateau forcé" : "BME"} · photo / ${s.photo_interval_s} s · prochaine ${fmtRemain(s.photo_next_s)}`
+    ? `ON · ${regime}${cooling} · photo / ${s.photo_interval_s} s · prochaine ${fmtRemain(s.photo_next_s)}`
     : (s.heat_forced || s.heater_on ? "Chauffe forcée" : "Veille");
   $("btnHeatAuto").hidden = !s.heat_forced;
 
