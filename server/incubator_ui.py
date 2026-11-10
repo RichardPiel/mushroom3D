@@ -108,6 +108,10 @@ BED_SLEW_C = 2.0
 # Un ordre de chauffe sous la mesure n'existe pas : le plateau est coupé
 # tant qu'il n'est pas redescendu à la consigne (marge pour le maintien).
 BED_ORDER_SLACK_C = 0.4
+# Hystérésis : on n'allume que nettement sous la consigne, on n'éteint que nettement au-dessus.
+BED_ON_GAP_C = 1.0
+BED_OFF_GAP_C = 2.0
+BED_MIN_HOLD_S = 120.0
 AIR_LOOKAHEAD_S = 180.0
 AIR_HISTORY_S = 1800.0
 FORECAST_MIN_S = 60
@@ -434,6 +438,7 @@ class IncubatorController:
         self._heat_tick_at = 0.0
         self._bed_command: float | None = None
         self._bed_sent: float | None = None
+        self._heat_state_at = 0.0
         self._air_hist: deque[tuple[float, float]] = deque()
         self._air_wall: deque[tuple[float, float]] = deque()
         self._air_rate = 0.0
@@ -801,7 +806,7 @@ class IncubatorController:
                 "target_temp": self.target_temp,
                 "heat_forced": self.heat_forced,
                 "forced_bed_temp": self.forced_bed_temp,
-                "bed_command": None if self._bed_command is None else self._realizable_bed(self._bed_command),
+                "bed_command": None if self._bed_command is None else self._stable_order(self._bed_command),
                 "culture_temp_min": self.culture_temp_min,
                 "culture_temp_max": self.culture_temp_max,
                 "culture_hum_min": self.culture_hum_min,
@@ -1067,13 +1072,42 @@ class IncubatorController:
         )
 
     def _realizable_bed(self, temp_c: float) -> float:
-        """Ordre réellement envoyé. Sous la température mesurée, la chauffe est coupée."""
+        """Ordre réalisable, sans tenir compte du temps mini entre deux bascules."""
         temp_c = round(max(0.0, min(110.0, float(temp_c))), 1)
         if temp_c <= 0 or self.bed_actual is None:
             return temp_c
-        if float(self.bed_actual) <= temp_c + BED_ORDER_SLACK_C:
+        actual = float(self.bed_actual)
+        if self.heat_forced:
+            if actual <= temp_c + BED_ORDER_SLACK_C:
+                return temp_c
+            return 0.0
+        heating = self._bed_sent is not None and self._bed_sent > 0
+        if heating:
+            if temp_c + BED_OFF_GAP_C >= actual:
+                return temp_c
+            return 0.0
+        if temp_c >= actual + BED_ON_GAP_C:
             return temp_c
         return 0.0
+
+    def _stable_order(self, temp_c: float, *, hold: bool = True) -> float:
+        """Caller holds self.lock. Empêche d'allumer et d'éteindre à chaque mesure."""
+        order = self._realizable_bed(temp_c)
+        if not hold or self.heat_forced or self._bed_sent is None:
+            return order
+        was_on = self._bed_sent > 0
+        on = order > 0
+        if was_on == on:
+            return order
+        air = self._air_c()
+        urgent_off = was_on and not on and air is not None and air >= self.culture_temp_max
+        if (
+            self._heat_state_at > 0
+            and not urgent_off
+            and time.monotonic() - self._heat_state_at < BED_MIN_HOLD_S
+        ):
+            return self._bed_sent if was_on else 0.0
+        return order
 
     def _queue_bed(self, temp_c: float, *, start: bool = False) -> None:
         """Caller holds self.lock. Mémorise la consigne, envoie un ordre réalisable."""
@@ -1092,7 +1126,10 @@ class IncubatorController:
         """Caller holds self.lock."""
         if self._bed_command is None:
             return
-        order = self._realizable_bed(self._bed_command)
+        order = self._stable_order(self._bed_command, hold=not start)
+        was_on = self._bed_sent is not None and self._bed_sent > 0
+        if was_on != (order > 0) and (self._bed_sent is not None or order > 0):
+            self._heat_state_at = time.monotonic()
         if not start and self._bed_sent is not None and abs(order - self._bed_sent) < 0.3:
             return
         self.heater_on = order > 0
