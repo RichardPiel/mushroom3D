@@ -818,6 +818,7 @@ class IncubatorController:
                 "camera_on": bool(self.camera_url),
                 "camera_url": self.camera_url,
                 "light_on": self.light_on,
+                "light_target": self.light_target,
                 "light_mode": self.light_mode,
                 "sun_lat": self.sun_lat,
                 "sun_lon": self.sun_lon,
@@ -1600,6 +1601,7 @@ class IncubatorController:
         changed = on != self.light_target
         self.light_target = on
         if self.light_known and self.light_on == on:
+            self.commands = deque(cmd for cmd in self.commands if cmd.get("type") != "light")
             return
         pending_same = any(
             cmd.get("type") == "light" and bool(cmd.get("on")) == on for cmd in self.commands
@@ -1640,8 +1642,6 @@ class IncubatorController:
             if on is None:
                 self.last_error = ""
                 return self.status()
-            if self.light_mode != "sun":
-                self.light_on = bool(on)
             self._ensure_light(bool(on), force=True)
             self.last_error = ""
             return self.status()
@@ -2305,10 +2305,11 @@ function applyStatus(s) {
   $("btnHeatAuto").hidden = !s.heat_forced;
 
   const lightBtn = $("btnLight");
-  lightBtn.className = s.light_on ? "btn-ghost" : "btn-gold";
-  lightBtn.dataset.on = s.light_on ? "1" : "0";
-  lightBtn.setAttribute("aria-pressed", s.light_on ? "true" : "false");
-  lightBtn.setAttribute("aria-label", s.light_on ? "Éteindre le flash" : "Allumer le flash");
+  const lightShown = s.light_mode === "manual" ? !!s.light_target : !!s.light_on;
+  lightBtn.className = lightShown ? "btn-ghost" : "btn-gold";
+  lightBtn.dataset.on = lightShown ? "1" : "0";
+  lightBtn.setAttribute("aria-pressed", lightShown ? "true" : "false");
+  lightBtn.setAttribute("aria-label", lightShown ? "Éteindre le flash" : "Allumer le flash");
 
   const ventOn = s.vent_mode !== "off";
   const ventBtn = $("btnVent");
