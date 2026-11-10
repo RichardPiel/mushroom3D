@@ -112,7 +112,6 @@ FORECAST_MIN_S = 60
 FORECAST_MAX_S = 1800
 AIR_RATE_MIN_SPAN_S = 45.0
 AIR_RATE_MAX = 0.03
-AIR_FORECAST_MIN_C = 0.2
 HEAT_I_MAX = 12.0 / AIR_KI
 HEAT_I_MIN = -15.0 / AIR_KI
 
@@ -298,7 +297,7 @@ def solar_elevation_deg(latitude: float, longitude: float, when: datetime) -> fl
 def air_bed_command(
     target_c: float, air_c: float, integral: float, dt_s: float
 ) -> tuple[float, float]:
-    """Consigne plateau pour ramener le BME sur un bord de la plage.
+    """Consigne plateau pour ramener le BME vers une température d'air.
 
     Retourne (plateau_°C, intégrale). Le plateau automatique reste dans
     BED_AUTO_MIN…BED_AUTO_MAX ; un forçage manuel peut dépasser ce plafond.
@@ -1176,39 +1175,26 @@ class IncubatorController:
             return None
         return round(self._air_rate * 60.0, 3)
 
-    def _band_edge(self, air: float) -> float | None:
-        """Bord déjà franchi, ou None si le BME est dans la plage."""
-        if air < self.culture_temp_min:
-            return self.culture_temp_min
-        if air > self.culture_temp_max:
-            return self.culture_temp_max
-        return None
+    def _culture_mid(self) -> float:
+        """Milieu de la plage : température d'air visée."""
+        return (float(self.culture_temp_min) + float(self.culture_temp_max)) / 2.0
 
-    def _forecast_edge(self, air: float) -> tuple[float | None, float]:
-        """Bord vers lequel la pente actuelle emmène le BME, et la température prévue."""
-        pred = air + self._air_rate * self.forecast_s
-        if self._air_rate > 0 and pred - self.culture_temp_max >= AIR_FORECAST_MIN_C:
-            return self.culture_temp_max, pred
-        if self._air_rate < 0 and self.culture_temp_min - pred >= AIR_FORECAST_MIN_C:
-            return self.culture_temp_min, pred
-        return None, pred
+    def _air_sense(self, air: float) -> tuple[float, bool]:
+        """Température pilotée. La pente, quand elle est connue, anticipe sur la durée réglée."""
+        if not self._air_rate_ready:
+            return air, False
+        return air + self._air_rate * self.forecast_s, True
 
     def _auto_bed_now(self) -> float:
         """Caller holds self.lock. Consigne plateau immédiate, sans avancer l'intégrale."""
         air = self._air_c()
-        if air is None or air >= self.culture_temp_max:
+        if air is None or air >= self._culture_mid():
             return 0.0
-        if air < self.culture_temp_min:
-            bed, _integral = air_bed_command(self.culture_temp_min, air, self._heat_i, 0.0)
-            return bed
-        edge, pred = self._forecast_edge(air)
-        if edge != self.culture_temp_min:
-            return 0.0
-        bed, _integral = air_bed_command(edge, pred, 0.0, 0.0)
+        bed, _integral = air_bed_command(self._culture_mid(), air, 0.0, 0.0)
         return bed
 
     def _control_bed(self) -> None:
-        """Caller holds self.lock. Maintient le BME dans la plage min–max."""
+        """Caller holds self.lock. Ramène le BME vers le milieu de la plage."""
         if not self.incubator_running:
             self._cool_vent = False
             return
@@ -1227,43 +1213,38 @@ class IncubatorController:
         self._sync_cool_vent(air)
         if self.heat_forced:
             return
-        edge = self._band_edge(air)
-        forecast = False
-        pred = air
-        if edge is None:
-            edge, pred = self._forecast_edge(air)
-            forecast = edge is not None
-        if edge is None:
+        center = self._culture_mid()
+        sense, forecast = self._air_sense(air)
+        if air < self.culture_temp_min:
+            sense = min(air, sense)
+            forecast = sense != air
+        error = center - sense
+        if self._heat_i * error < 0 and abs(error) >= AIR_DEADBAND_C:
             self._heat_i = 0.0
-            return
         now = time.monotonic()
         if self._heat_tick_at <= 0:
             dt = 5.0
         else:
             dt = min(30.0, max(0.5, now - self._heat_tick_at))
         self._heat_tick_at = now
-        if forecast:
-            bed, _integral = air_bed_command(edge, pred, 0.0, 0.0)
-            self._heat_i = 0.0
-            if edge == self.culture_temp_max:
-                bed = 0.0 if self._bed_command is None else min(bed, self._bed_command)
-            elif self._bed_command is not None:
-                bed = max(bed, self._bed_command)
-        else:
-            bed, self._heat_i = air_bed_command(edge, air, self._heat_i, dt)
-            if air > self.culture_temp_max and self._bed_command is not None:
-                bed = min(bed, self._bed_command)
-        if self._bed_command is not None:
+        bed, self._heat_i = air_bed_command(center, sense, self._heat_i, dt)
+        if air >= self.culture_temp_max and self._bed_command is not None:
+            bed = min(bed, self._bed_command)
+        actual = None if self.bed_actual is None else float(self.bed_actual)
+        need_heat = actual is not None and air < center and bed > actual
+        cut_heat = actual is not None and bed + BED_ORDER_SLACK_C < actual
+        if self._bed_command is not None and not need_heat and not cut_heat:
             bed = min(self._bed_command + BED_SLEW_C, max(self._bed_command - BED_SLEW_C, bed))
             bed = round(bed, 1)
         if self._bed_command is not None and abs(bed - self._bed_command) < 0.3:
             return
         self._queue_bed(bed)
         log.info(
-            "Plateau %.1f °C (%sBME %.1f °C, plage %.1f–%.1f °C)",
+            "Plateau %.1f °C (%sBME %.1f °C, milieu %.1f °C, plage %.1f–%.1f °C)",
             bed,
-            f"prévu {pred:.1f} °C, " if forecast else "",
+            f"prévu {sense:.1f} °C, " if forecast else "",
             air,
+            center,
             self.culture_temp_min,
             self.culture_temp_max,
         )
@@ -2032,7 +2013,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 <button type="button" class="btn-ghost" id="btnStopKeep">Pause</button>
                 <button type="button" class="btn-danger" id="btnOff">Éteindre</button>
               </div>
-              <p class="hint">La plage min–max est la consigne du BME. S'il descend vers le minimum, le plateau chauffe avant de l'atteindre. S'il monte vers le maximum, le plateau baisse avant. Au-delà du maximum, la ventilation reste allumée. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
+              <p class="hint">La plage min–max est la consigne du BME. Le plateau vise le milieu. Sous le minimum, il chauffe tout de suite. Vers le maximum, il baisse avant de l'atteindre. Au-delà, la ventilation reste allumée. Forcer plateau impose la chauffe, jusqu'à 110 °C.</p>
               <button type="button" class="btn-ghost" id="btnHeatAuto" hidden>Reprendre la plage</button>
             </div>
           </div>
