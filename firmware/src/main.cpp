@@ -23,6 +23,7 @@ bool last_link_ok = false;
 uint32_t vent_cycle_start_ms = 0;
 uint32_t vent_off_at_ms = 0;
 uint32_t last_vent_cmd_ms = 0;
+uint32_t last_light_ms = 0;
 
 void connectWifi() {
   WiFi.mode(WIFI_STA);
@@ -48,6 +49,20 @@ bool applyVent(bool on) {
     desired.vent_on = on;
   }
   return ok;
+}
+
+void tickLight() {
+  // La Centauri lâche parfois la LED : on la réapplique tant que l'ordre est ON.
+  if (!desired.light_on) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (now - last_light_ms < 30000) {
+    return;
+  }
+  if (printer.setLight(true)) {
+    last_light_ms = now;
+  }
 }
 
 void tickVentilation() {
@@ -105,9 +120,15 @@ void handleCommand(JsonObjectConst cmd, JsonObject result) {
     desired.vent_on = false;
     result["ok"] = true;
   } else if (strcmp(type, "light") == 0) {
-    bool on = cmd["on"] | false;
+    bool on = false;
+    if (cmd["on"].is<bool>()) {
+      on = cmd["on"].as<bool>();
+    } else if (!cmd["on"].isNull()) {
+      on = cmd["on"].as<int>() != 0;
+    }
     if (printer.setLight(on)) {
       desired.light_on = on;
+      last_light_ms = millis();
       result["ok"] = true;
     } else {
       result["error"] = "light failed";
@@ -238,6 +259,7 @@ void loop() {
   }
 
   tickVentilation();
+  tickLight();
 
   if (desired.heater_on && now - last_heater_ms >= HEATER_KEEPALIVE_MS) {
     if (printer.setBedTemperature(desired.target_temp)) {

@@ -213,11 +213,12 @@ def solar_elevation_deg(latitude: float, longitude: float, when: datetime) -> fl
     gmst = math.radians((280.46061837 + 360.98564736629 * n) % 360)
     hour_angle = gmst + math.radians(longitude) - right_asc
     lat = math.radians(latitude)
-    elevation = math.asin(
+    sine = (
         math.sin(lat) * math.sin(declination)
         + math.cos(lat) * math.cos(declination) * math.cos(hour_angle)
     )
-    return math.degrees(elevation)
+    sine = max(-1.0, min(1.0, sine))
+    return math.degrees(math.asin(sine))
 
 
 def sun_is_up(latitude: float, longitude: float, when: datetime | None = None) -> tuple[bool, float]:
@@ -330,6 +331,7 @@ class IncubatorController:
         self.heater_on = False
         self.incubator_running = False
         self.light_on = False
+        self.light_target = False
         self.light_mode = cfg.get("light_mode") if cfg.get("light_mode") in ("manual", "sun") else "manual"
         self.sun_lat = _cfg_float(cfg, "sun_lat", _env_float("SUN_LAT", DEFAULT_SUN_LAT))
         self.sun_lon = _cfg_float(cfg, "sun_lon", _env_float("SUN_LON", DEFAULT_SUN_LON))
@@ -721,12 +723,37 @@ class IncubatorController:
         self.sun_elevation = elevation
         return None
 
-    def _command_light(self, on: bool) -> None:
-        """Caller holds self.lock."""
-        self.light_on = bool(on)
+    def _queue_light(self, on: bool) -> None:
+        """Enqueue a light order unless the same one is already waiting. Caller holds self.lock."""
+        on = bool(on)
+        kept = deque(
+            cmd for cmd in self.commands if cmd.get("type") != "light" or bool(cmd.get("on")) == on
+        )
+        self.commands = kept
+        if any(cmd.get("type") == "light" for cmd in self.commands):
+            return
         self._last_light_cmd = time.monotonic()
-        self._enqueue({"type": "light", "on": self.light_on})
-        self._append_metrics()
+        self._enqueue({"type": "light", "on": on})
+
+    def _ensure_light(self, on: bool, *, force: bool = False) -> None:
+        """Hold the lamp on the target. Caller holds self.lock.
+
+        A single order is easy to lose, and the relay then reports the old state.
+        Retry quickly while the reported lamp differs, and refresh every 30 s so
+        the printer does not drop the LED.
+        """
+        on = bool(on)
+        changed = on != self.light_target
+        self.light_target = on
+        pending_same = any(
+            cmd.get("type") == "light" and bool(cmd.get("on")) == on for cmd in self.commands
+        )
+        if pending_same and not force:
+            return
+        elapsed = time.monotonic() - self._last_light_cmd
+        mismatch = self.light_on != on
+        if force or changed or (mismatch and elapsed >= 5) or elapsed >= 30:
+            self._queue_light(on)
 
     def set_light(
         self,
@@ -758,7 +785,9 @@ class IncubatorController:
             if on is None:
                 self.last_error = ""
                 return self.status()
-            self._command_light(bool(on))
+            if self.light_mode != "sun":
+                self.light_on = bool(on)
+            self._ensure_light(bool(on), force=True)
             self.last_error = ""
             return self.status()
 
@@ -777,13 +806,7 @@ class IncubatorController:
             self.sun_elevation = elevation
             if self.light_mode != "sun":
                 return
-            if any(cmd.get("type") == "light" for cmd in self.commands):
-                return
-            if time.monotonic() - self._last_light_cmd < 20:
-                return
-            if self.light_on == up:
-                return
-            self._command_light(up)
+            self._ensure_light(up)
 
     def _tick_photos(self) -> None:
         with self.lock:
@@ -1265,8 +1288,11 @@ function applyStatus(s) {
   lightBtn.className = s.light_on ? "btn-ghost" : "btn-gold";
   lightBtn.dataset.on = s.light_on ? "1" : "0";
   const sunEl = Number(s.sun_elevation);
+  const lamp = s.light_on ? "allumé" : "éteint";
   $("sunState").textContent = Number.isFinite(sunEl)
-    ? `${s.sun_up ? "Jour" : "Nuit"} · soleil ${sunEl.toFixed(0)}°`
+    ? (s.light_mode === "sun"
+      ? `${s.sun_up ? "Jour" : "Nuit"} · soleil ${sunEl.toFixed(0)}° · flash ${lamp}`
+      : `${s.sun_up ? "Jour" : "Nuit"} · soleil ${sunEl.toFixed(0)}°`)
     : "—";
   for (const b of $("lightMode").querySelectorAll("button")) {
     b.setAttribute("aria-pressed", b.dataset.mode === (s.light_mode || "manual") ? "true" : "false");
@@ -1563,12 +1589,17 @@ $("btnLight").onclick = async () => {
 $("lightMode").onclick = async (ev) => {
   const btn = ev.target.closest("button[data-mode]");
   if (!btn) return;
-  const body = { mode: btn.dataset.mode, ...sunPlace() };
-  if (body.mode === "manual") body.on = $("btnLight").dataset.on === "1";
-  await api("/api/light", { method: "POST", body: JSON.stringify(body) });
-  $("sunLat").dataset.dirty = "";
-  $("sunLon").dataset.dirty = "";
-  refreshStatus();
+  try {
+    const body = { mode: btn.dataset.mode, ...sunPlace() };
+    if (body.mode === "manual") body.on = $("btnLight").dataset.on === "1";
+    await api("/api/light", { method: "POST", body: JSON.stringify(body) });
+    $("sunLat").dataset.dirty = "";
+    $("sunLon").dataset.dirty = "";
+    refreshStatus();
+  } catch (e) {
+    $("err").textContent = e.message || String(e);
+    $("err").classList.add("show");
+  }
 };
 $("btnSnap").onclick = async () => {
   const r = await api("/api/snapshot", { method: "POST", body: "{}" });
