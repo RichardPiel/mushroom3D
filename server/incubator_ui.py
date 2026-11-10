@@ -103,6 +103,9 @@ AIR_SANE_MAX = 70.0
 BED_AUTO_MIN = 0.0
 BED_AUTO_MAX = 60.0
 BED_SLEW_C = 2.0
+# Un ordre de chauffe sous la mesure n'existe pas : le plateau est coupé
+# tant qu'il n'est pas redescendu à la consigne (marge pour le maintien).
+BED_ORDER_SLACK_C = 0.4
 AIR_LOOKAHEAD_S = 180.0
 AIR_HISTORY_S = 1800.0
 FORECAST_MIN_S = 60
@@ -429,6 +432,7 @@ class IncubatorController:
         self._heat_i = 0.0
         self._heat_tick_at = 0.0
         self._bed_command: float | None = None
+        self._bed_sent: float | None = None
         self._air_hist: deque[tuple[float, float]] = deque()
         self._air_wall: deque[tuple[float, float]] = deque()
         self._air_rate = 0.0
@@ -796,7 +800,7 @@ class IncubatorController:
                 "target_temp": self.target_temp,
                 "heat_forced": self.heat_forced,
                 "forced_bed_temp": self.forced_bed_temp,
-                "bed_command": self._bed_command,
+                "bed_command": None if self._bed_command is None else self._realizable_bed(self._bed_command),
                 "culture_temp_min": self.culture_temp_min,
                 "culture_temp_max": self.culture_temp_max,
                 "culture_hum_min": self.culture_hum_min,
@@ -1022,6 +1026,7 @@ class IncubatorController:
 
             if bme.get("ok") and bme.get("temperature_c") is not None:
                 self._control_bed()
+            self._sync_bed_order()
             self._append_metrics()
             self._persist_runtime()
             return {"ok": True}
@@ -1060,19 +1065,52 @@ class IncubatorController:
             cmd for cmd in self.commands if cmd.get("type") not in ("heater_set", "incubator_start")
         )
 
-    def _queue_bed(self, temp_c: float, *, start: bool = False) -> None:
-        """Caller holds self.lock. Remplace un ordre plateau déjà en file."""
+    def _realizable_bed(self, temp_c: float) -> float:
+        """Ordre réellement envoyé. Sous la température mesurée, la chauffe est coupée."""
         temp_c = round(max(0.0, min(110.0, float(temp_c))), 1)
-        self._bed_command = temp_c
+        if temp_c <= 0 or self.bed_actual is None:
+            return temp_c
+        if float(self.bed_actual) <= temp_c + BED_ORDER_SLACK_C:
+            return temp_c
+        return 0.0
+
+    def _queue_bed(self, temp_c: float, *, start: bool = False) -> None:
+        """Caller holds self.lock. Mémorise la consigne, envoie un ordre réalisable."""
+        self._bed_command = round(max(0.0, min(110.0, float(temp_c))), 1)
+        self._send_bed_order(start=start)
+
+    def _sync_bed_order(self) -> None:
+        """Caller holds self.lock. Réévalue l'ordre quand la mesure du plateau change."""
+        if self._bed_command is None:
+            return
+        if not self.incubator_running and not self.heat_forced and self._bed_command <= 0:
+            return
+        self._send_bed_order(start=False)
+
+    def _send_bed_order(self, *, start: bool) -> None:
+        """Caller holds self.lock."""
+        if self._bed_command is None:
+            return
+        order = self._realizable_bed(self._bed_command)
+        if not start and self._bed_sent is not None and abs(order - self._bed_sent) < 0.3:
+            return
+        self.heater_on = order > 0
+        if order == 0.0 and self._bed_command > 0 and self.bed_actual is not None:
+            log.info(
+                "Plateau à %.2f °C, consigne %.1f °C sous la mesure — chauffe coupée",
+                self.bed_actual,
+                self._bed_command,
+            )
+        self._bed_sent = order
         kind = "incubator_start" if start else "heater_set"
         for cmd in self.commands:
             if cmd.get("type") in ("heater_set", "incubator_start"):
                 if start:
                     cmd["type"] = "incubator_start"
-                cmd["temp"] = temp_c
+                cmd["temp"] = order
                 self._cmd_event.set()
                 return
-        self._enqueue({"type": kind, "temp": temp_c})
+        self._enqueue({"type": kind, "temp": order})
 
     def _air_c(self) -> float | None:
         """Caller holds self.lock. Température BME utilisable pour le pilotage."""
@@ -1218,9 +1256,8 @@ class IncubatorController:
         if self._bed_command is not None:
             bed = min(self._bed_command + BED_SLEW_C, max(self._bed_command - BED_SLEW_C, bed))
             bed = round(bed, 1)
-        if self._bed_command is not None and abs(bed - self._bed_command) < 0.3 and self.heater_on == (bed > 0):
+        if self._bed_command is not None and abs(bed - self._bed_command) < 0.3:
             return
-        self.heater_on = bed > 0
         self._queue_bed(bed)
         log.info(
             "Plateau %.1f °C (%sBME %.1f °C, plage %.1f–%.1f °C)",
@@ -1331,6 +1368,7 @@ class IncubatorController:
             self._ensure_light(False, force=True)
             self._drop_bed_commands()
             self._bed_command = 0.0
+            self._bed_sent = 0.0
             self._reset_air_trend()
             self._enqueue({"type": "heater_off"})
             self._enqueue(
@@ -1467,6 +1505,7 @@ class IncubatorController:
                 self._heat_i = 0.0
                 self._drop_bed_commands()
                 self._bed_command = 0.0
+                self._bed_sent = 0.0
             self.vent_mode = "off"
             self.vent_on = False
             self._cool_vent = False
@@ -2181,7 +2220,7 @@ function applyStatus(s) {
   $("bedActual").innerHTML = fmtNum(s.bed_actual, 2) + "<small> °C</small>";
   const bedOrder = s.bed_command != null ? s.bed_command : s.bed_target;
   $("bedCmd").textContent = s.heat_forced
-    ? `forcé ${fmtNum(bedOrder, 1)} °C`
+    ? (bedOrder > 0 ? `forcé ${fmtNum(bedOrder, 1)} °C` : "forcé · coupé")
     : (s.incubator_running ? `ordre ${fmtNum(bedOrder, 1)} °C` : (s.heater_on ? `manuel ${fmtNum(bedOrder, 1)} °C` : ""));
   $("bedTarget").innerHTML = `${fmtNum(s.culture_temp_min, 1)}–${fmtNum(s.culture_temp_max, 1)}<small> °C</small>`;
   $("chamberTemp").innerHTML = fmtNum(s.chamber_c) + "<small> °C</small>";
