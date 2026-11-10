@@ -339,7 +339,7 @@ def read_metrics_window(window: str = "60m", max_points: int = 480) -> dict[str,
                 ts = _parse_ts_utc(row.get("ts_utc", ""))
                 if ts is None or ts.timestamp() < cutoff:
                     continue
-                item: dict[str, Any] = {"t": ts.strftime("%Y-%m-%dT%H:%M:%SZ")}
+                item: dict[str, Any] = {"t": int(ts.timestamp() * 1000)}
                 for field in (*METRICS_SERIES, *METRICS_FLAGS):
                     item[field] = _float_or_none(row.get(field, ""))
                 points.append(item)
@@ -2294,6 +2294,12 @@ const LANES = [
   { key: "light_on", color: "rgba(255, 208, 122, .95)", label: "Flash", tip: "Flash", swatch: "#ffd07a" },
 ];
 
+function chartTimeMs(raw) {
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw < 1e11 ? raw * 1000 : raw;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
 function niceRange(min, max, pad = 0.08) {
   if (!Number.isFinite(min) || !Number.isFinite(max)) return { min: 0, max: 1 };
   if (min === max) { min -= 1; max += 1; }
@@ -2316,12 +2322,12 @@ function chartGeom(canvas, points) {
   const pad = { l: 48, r: 44, t: 16, b: 22 + LANES.length * (laneH + laneGap) };
   const w = cssW - pad.l - pad.r;
   const h = cssH - pad.t - pad.b;
-  const t0 = n ? points[0].t : 0;
-  const t1 = n ? points[n - 1].t : 0;
+  const t0 = n ? chartTimeMs(points[0].t) : 0;
+  const t1 = n ? chartTimeMs(points[n - 1].t) : 0;
   const span = Math.max(t1 - t0, 60 * 1000);
-  const futureMs = n ? futureSpanMs(span) : 0;
+  const futureMs = n && Number.isFinite(span) ? futureSpanMs(span) : 0;
   const total = span + futureMs;
-  const xAtTime = (t) => pad.l + ((t - t0) / total) * w;
+  const xAtTime = (t) => pad.l + ((chartTimeMs(t) - t0) / total) * w;
   const xAt = (i) => (n ? xAtTime(points[Math.max(0, Math.min(n - 1, i))].t) : pad.l);
   return { cssW, cssH, laneH, laneGap, pad, w, h, xAt, xAtTime, t0, t1, futureMs, total };
 }
@@ -2353,7 +2359,7 @@ function drawMetricsChart(points, hoverIdx = -1, hoverFuture = null) {
     for (let i = points.length - 1; i >= 0; i--) {
       if (points[i].air_c != null) {
         slope = {
-          t: points[i].t,
+          t: chartTimeMs(points[i].t),
           v0: points[i].air_c,
           v1: points[i].air_c + airForecast.ratePerMin * (futureMs / 60000),
         };
@@ -2546,7 +2552,7 @@ function chartPointer(clientX) {
   let best = 0;
   let bestD = Infinity;
   for (let i = 0; i < n; i++) {
-    const d = Math.abs(chartPoints[i].t - t);
+    const d = Math.abs(chartTimeMs(chartPoints[i].t) - t);
     if (d < bestD) { bestD = d; best = i; }
   }
   return { idx: best, futureT: null };
@@ -2561,7 +2567,7 @@ function showChartTip(idx, futureT, clientX, clientY) {
     for (let i = chartPoints.length - 1; i >= 0; i--) {
       if (chartPoints[i].air_c != null) {
         base = chartPoints[i].air_c;
-        baseT = chartPoints[i].t;
+        baseT = chartTimeMs(chartPoints[i].t);
         break;
       }
     }
@@ -2606,7 +2612,10 @@ function showChartTip(idx, futureT, clientX, clientY) {
 async function refreshChart() {
   try {
     const data = await api("/api/metrics?window=" + encodeURIComponent(chartWindow));
-    chartPoints = data.points || [];
+    chartPoints = (data.points || []).flatMap((p) => {
+      const t = chartTimeMs(p.t);
+      return Number.isFinite(t) ? [{ ...p, t }] : [];
+    });
     chartHover = -1;
     chartHoverFuture = null;
     $("chartTip").classList.remove("show");
