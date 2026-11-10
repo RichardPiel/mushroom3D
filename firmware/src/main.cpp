@@ -24,6 +24,7 @@ uint32_t vent_cycle_start_ms = 0;
 uint32_t vent_off_at_ms = 0;
 uint32_t last_vent_cmd_ms = 0;
 uint32_t last_light_ms = 0;
+constexpr uint32_t kVentOffRetryMs = 10000;
 
 void connectWifi() {
   WiFi.mode(WIFI_STA);
@@ -51,23 +52,39 @@ bool applyVent(bool on) {
   return ok;
 }
 
+void holdFanOff(uint32_t now) {
+  if (printer.state().box_fan <= 0 && !desired.vent_on) {
+    return;
+  }
+  if (last_vent_cmd_ms != 0 && now - last_vent_cmd_ms < kVentOffRetryMs) {
+    return;
+  }
+  applyVent(false);
+}
+
 void tickVentilation() {
   const uint32_t now = millis();
+  const uint32_t interval_ms = (uint32_t)desired.vent_interval_s * 1000UL;
+  const uint32_t duration_ms = (uint32_t)desired.vent_duration_s * 1000UL;
   if (desired.vent_mode == "cycle") {
     if (desired.vent_on) {
       desired.vent_remaining_s = (int)max(0L, (long)(vent_off_at_ms - now) / 1000L);
       if (now >= vent_off_at_ms) {
-        applyVent(false);
+        if (last_vent_cmd_ms == 0 || now - last_vent_cmd_ms >= kVentOffRetryMs) {
+          applyVent(false);
+        }
       } else if (now - last_vent_cmd_ms >= HEATER_KEEPALIVE_MS) {
         applyVent(true);
       }
     } else {
       desired.vent_remaining_s =
-          (int)max(0L, (long)(vent_cycle_start_ms + desired.vent_interval_s * 1000UL - now) / 1000L);
-      if (now - vent_cycle_start_ms >= (uint32_t)desired.vent_interval_s * 1000UL) {
+          (int)max(0L, (long)(vent_cycle_start_ms + interval_ms - now) / 1000L);
+      if (interval_ms > duration_ms && now - vent_cycle_start_ms >= interval_ms) {
         vent_cycle_start_ms = now;
-        vent_off_at_ms = now + (uint32_t)desired.vent_duration_s * 1000UL;
+        vent_off_at_ms = now + duration_ms;
         applyVent(true);
+      } else {
+        holdFanOff(now);
       }
     }
   } else if (desired.vent_mode == "manual" && desired.vent_on) {
@@ -77,6 +94,7 @@ void tickVentilation() {
     }
   } else {
     desired.vent_remaining_s = -1;
+    holdFanOff(now);
   }
 }
 
@@ -128,6 +146,8 @@ void handleCommand(JsonObjectConst cmd, JsonObject result) {
       result["error"] = "light failed";
     }
   } else if (strcmp(type, "vent") == 0) {
+    const String prev_mode = desired.vent_mode;
+    const bool was_on = desired.vent_on;
     desired.vent_mode = String(cmd["mode"] | "off");
     desired.vent_speed = cmd["speed"] | desired.vent_speed;
     desired.vent_interval_s = cmd["interval_s"] | desired.vent_interval_s;
@@ -137,9 +157,15 @@ void handleCommand(JsonObjectConst cmd, JsonObject result) {
     } else if (desired.vent_mode == "manual") {
       applyVent(desired.vent_speed > 0);
     } else if (desired.vent_mode == "cycle") {
-      vent_cycle_start_ms = millis();
-      vent_off_at_ms = vent_cycle_start_ms + (uint32_t)desired.vent_duration_s * 1000UL;
-      applyVent(true);
+      const uint32_t now = millis();
+      const uint32_t interval_ms = (uint32_t)desired.vent_interval_s * 1000UL;
+      const bool in_pause = prev_mode == "cycle" && !was_on && interval_ms > 0 &&
+                            now - vent_cycle_start_ms < interval_ms;
+      if (!in_pause) {
+        vent_cycle_start_ms = now;
+        vent_off_at_ms = now + (uint32_t)desired.vent_duration_s * 1000UL;
+        applyVent(true);
+      }
     }
     result["ok"] = true;
   } else if (strcmp(type, "incubator_start") == 0) {

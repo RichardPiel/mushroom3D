@@ -91,6 +91,10 @@ DEFAULT_PHOTO_INTERVAL_S = 1800
 DEFAULT_VENT_SPEED = 60
 DEFAULT_VENT_INTERVAL_S = 1800
 DEFAULT_VENT_ON_S = 120
+# Si l'arrêt n'a pas pris, on le renvoie. Pas à chaque mesure.
+VENT_OFF_RETRY_S = 60.0
+# Laisser à la carte le temps d'appliquer l'ordre avant de le contredire.
+VENT_REPORT_GRACE_S = 15.0
 DEFAULT_SUN_LAT = 48.8566
 DEFAULT_SUN_LON = 2.3522
 SUN_UP_ELEVATION_DEG = -0.833
@@ -445,6 +449,12 @@ class IncubatorController:
         self._air_rate_ready = False
         self._air_sane = True
         self._cool_vent = False
+        self._vent_burst_at = 0.0
+        self._vent_resume_at = 0.0
+        self._vent_fw: str | None = None
+        self._vent_fw_at = 0.0
+        self._vent_reported: str | None = None
+        self._vent_report_at = 0.0
         self._last_photo_wall: float | None = None
         self._state_restored = False
         self.photo_interval_s = _cfg_int(cfg, "photo_interval_s", DEFAULT_PHOTO_INTERVAL_S)
@@ -708,7 +718,10 @@ class IncubatorController:
             if self.incubator_running:
                 bed = 0.0 if self._bed_command is None else float(self._bed_command)
                 self._queue_bed(bed, start=True)
-                self._queue_vent("manual" if self._cool_vent else self.vent_mode)
+                if self.vent_mode == "cycle" and self._cool_vent:
+                    self._drive_cycle_fan(self._air_c())
+                else:
+                    self._queue_vent(self.vent_mode)
                 self.light_known = False
                 if self.light_mode == "sun":
                     on, elevation = sun_is_up(self.sun_lat, self.sun_lon)
@@ -1001,6 +1014,10 @@ class IncubatorController:
                 self.heater_on = bool(desired["heater_on"])
             if "vent_on" in desired:
                 self.vent_on = bool(desired["vent_on"])
+            reported_mode = desired.get("vent_mode")
+            if reported_mode in ("off", "manual", "cycle"):
+                self._vent_reported = str(reported_mode)
+                self._vent_report_at = time.monotonic()
             if desired.get("vent_remaining_s") is not None:
                 self.vent_remaining_s = int(desired["vent_remaining_s"])
             # La carte remet target_temp à 0 dès que le plateau s'éteint.
@@ -1245,6 +1262,7 @@ class IncubatorController:
             self._cool_vent = False
             return
         air = self._air_c()
+        self._drive_cycle_fan(air)
         if air is None:
             self._reset_air_trend()
             if not self.heat_forced and self._air_sane:
@@ -1256,7 +1274,6 @@ class IncubatorController:
             return
         self._air_sane = True
         self._note_air(air)
-        self._sync_cool_vent(air)
         if self.heat_forced:
             return
         center = self._culture_mid()
@@ -1297,7 +1314,7 @@ class IncubatorController:
         )
 
     def _queue_vent(self, mode: str) -> None:
-        """Caller holds self.lock. Remplace un ordre d'air déjà en file."""
+        """Caller holds self.lock. Un seul ordre d'air en file : le dernier gagne."""
         payload = {
             "type": "vent",
             "mode": mode,
@@ -1305,37 +1322,64 @@ class IncubatorController:
             "interval_s": self.vent_interval_s,
             "duration_s": self.vent_duration_s,
         }
-        updated = False
+        self._vent_fw = mode
+        self._vent_fw_at = time.monotonic()
+        kept: dict[str, Any] | None = None
+        rest: deque[dict[str, Any]] = deque()
         for cmd in self.commands:
-            if cmd.get("type") == "vent":
+            if cmd.get("type") != "vent":
+                rest.append(cmd)
+            elif kept is None:
                 cmd.update(payload)
-                updated = True
-        if updated:
+                kept = cmd
+        self.commands = rest
+        if kept is not None:
+            self.commands.append(kept)
             self._cmd_event.set()
             return
         self._enqueue(payload)
 
-    def _sync_cool_vent(self, air: float) -> None:
-        """Ventilation continue tant que le BME est au-dessus du max de la plage."""
-        if self.vent_mode != "cycle":
-            self._cool_vent = False
+    def _fan_spinning(self) -> bool:
+        """Caller holds self.lock. Vrai si l'imprimante rapporte encore un débit."""
+        return self.vent_actual is not None and float(self.vent_actual) > 0
+
+    def _drive_cycle_fan(self, air: float | None) -> None:
+        """Caller holds self.lock.
+
+        La rafale dure vent_duration_s, puis l'air s'arrête jusqu'à la reprise.
+        Au-dessus du max, on ne le laisse plus tourner sans fin.
+        """
+        if not self.incubator_running or self.vent_mode != "cycle":
             return
-        if self._cool_vent:
-            if air > self.culture_temp_max:
-                return
-            self._cool_vent = False
-            self._queue_vent("cycle")
-            log.info("Refroidissement terminé, cycle d'air repris (BME %.1f °C)", air)
+        now = time.monotonic()
+        if now < self._vent_resume_at:
+            if self._fan_spinning() and now - self._vent_fw_at >= VENT_OFF_RETRY_S:
+                self._queue_vent("off")
             return
-        if air <= self.culture_temp_max:
-            return
-        self._cool_vent = True
-        self._queue_vent("manual")
-        log.info(
-            "Ventilation continue pour refroidir (BME %.1f °C, max %.1f °C)",
-            air,
-            self.culture_temp_max,
+        report_fresh = self._vent_report_at > self._vent_fw_at
+        held = self._cool_vent or (
+            report_fresh
+            and self._vent_reported == "manual"
+            and now - self._vent_fw_at >= VENT_REPORT_GRACE_S
         )
+        if any(
+            cmd.get("type") == "vent" and cmd.get("mode") == "cycle" for cmd in self.commands
+        ) and not held:
+            return
+        if held:
+            self._cool_vent = False
+            pause = max(1.0, float(self.vent_interval_s) - float(self.vent_duration_s))
+            self._vent_resume_at = now + pause
+            self._queue_vent("off")
+            log.info(
+                "Ventilation arrêtée (BME %s, reprise dans %.0f s)",
+                "—" if air is None else f"{air:.1f} °C",
+                pause,
+            )
+            return
+        if self._vent_fw == "off":
+            self._queue_vent("cycle")
+            log.info("Cycle d'air repris")
 
     def _parse_temp(self, temp_c: float) -> float | None:
         try:
@@ -1374,9 +1418,7 @@ class IncubatorController:
                 bed = self._auto_bed_now()
                 self.heater_on = bed > 0
                 self._queue_bed(bed)
-                air = self._air_c()
-                if air is not None:
-                    self._sync_cool_vent(air)
+                self._drive_cycle_fan(self._air_c())
                 log.info("Pilotage plage repris, plateau %.1f °C", bed)
             return self.status()
 
@@ -1387,6 +1429,7 @@ class IncubatorController:
             self.heat_forced = False
             self._heat_i = 0.0
             self._cool_vent = False
+            self._vent_resume_at = 0.0
             self.vent_mode = "off"
             self._vent_saved = True
             self.vent_on = False
@@ -1399,15 +1442,7 @@ class IncubatorController:
             self._bed_sent = 0.0
             self._reset_air_trend()
             self._enqueue({"type": "heater_off"})
-            self._enqueue(
-                {
-                    "type": "vent",
-                    "mode": "off",
-                    "speed": self.vent_speed,
-                    "interval_s": self.vent_interval_s,
-                    "duration_s": self.vent_duration_s,
-                }
-            )
+            self._queue_vent("off")
             return self.status()
 
     def set_ventilation(
@@ -1422,7 +1457,6 @@ class IncubatorController:
             if mode not in ("off", "manual", "cycle"):
                 self.last_error = "Mode ventilation inconnu"
                 return self.status()
-            self._cool_vent = False
             new_speed = self.vent_speed if speed is None else int(speed)
             new_interval = self.vent_interval_s if interval_s is None else max(30, int(interval_s))
             new_duration = self.vent_duration_s if duration_s is None else max(5, int(duration_s))
@@ -1434,6 +1468,8 @@ class IncubatorController:
                 return self.status()
             if mode == "manual" and new_speed <= 0:
                 mode = "off"
+            self._cool_vent = False
+            self._vent_resume_at = 0.0
             self.vent_speed = new_speed
             self.vent_interval_s = new_interval
             self.vent_duration_s = new_duration
@@ -1441,15 +1477,7 @@ class IncubatorController:
             self._vent_saved = True
             self.vent_on = mode in ("manual", "cycle")
             self._persist_setpoints()
-            self._enqueue(
-                {
-                    "type": "vent",
-                    "mode": mode,
-                    "speed": new_speed,
-                    "interval_s": new_interval,
-                    "duration_s": new_duration,
-                }
-            )
+            self._queue_vent(mode)
             self.last_error = ""
             self._append_metrics()
             return self.status()
@@ -1498,6 +1526,8 @@ class IncubatorController:
             self.heater_on = bed > 0
             self.vent_mode = "cycle"
             self.vent_on = True
+            self._cool_vent = False
+            self._vent_resume_at = 0.0
             self._vent_saved = True
             self.light_mode = "sun"
             self.started_at = time.time()
@@ -1506,21 +1536,10 @@ class IncubatorController:
             _save_config({"light_mode": "sun"})
             self._stamp_photo_timer(self.photo_interval_s)
             self._queue_bed(bed, start=True)
-            self._enqueue(
-                {
-                    "type": "vent",
-                    "mode": "cycle",
-                    "speed": self.vent_speed,
-                    "interval_s": self.vent_interval_s,
-                    "duration_s": self.vent_duration_s,
-                }
-            )
+            self._queue_vent("cycle")
             up, elevation = sun_is_up(self.sun_lat, self.sun_lon)
             self.sun_elevation = elevation
             self._ensure_light(up, force=True)
-            air = self._air_c()
-            if air is not None:
-                self._sync_cool_vent(air)
             self.last_error = ""
             return self.status()
 
@@ -1537,21 +1556,14 @@ class IncubatorController:
             self.vent_mode = "off"
             self.vent_on = False
             self._cool_vent = False
+            self._vent_resume_at = 0.0
             self._vent_saved = True
             self.light_mode = "manual"
             self._reset_air_trend()
             self._persist_setpoints()
             _save_config({"light_mode": "manual"})
             self._enqueue({"type": "incubator_stop", "turn_off_heat": bool(turn_off_heat)})
-            self._enqueue(
-                {
-                    "type": "vent",
-                    "mode": "off",
-                    "speed": self.vent_speed,
-                    "interval_s": self.vent_interval_s,
-                    "duration_s": self.vent_duration_s,
-                }
-            )
+            self._queue_vent("off")
             if turn_off_heat:
                 self._ensure_light(False, force=True)
             return self.status()
@@ -1651,6 +1663,9 @@ class IncubatorController:
             try:
                 self._tick_sun()
                 self._tick_photos()
+                with self.lock:
+                    if self.incubator_running:
+                        self._drive_cycle_fan(self._air_c())
             except Exception:
                 log.exception("Scheduler")
             self._stop.wait(1.0)
