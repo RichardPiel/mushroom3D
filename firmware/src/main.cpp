@@ -251,7 +251,7 @@ void setup() {
   connectWifi();
 
   if (!bme680Begin(BME680_I2C_SDA, BME680_I2C_SCL, BME680_I2C_ADDR)) {
-    Serial.println("[bme680] absent — télémétrie sans capteur");
+    Serial.println("[bme680] absent — nouvel essai automatique");
   } else {
     Serial.println("[bme680] OK");
   }
