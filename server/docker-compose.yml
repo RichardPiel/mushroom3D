@@ -13,6 +13,14 @@ services:
       INCUBATOR_PASSWORD: ${INCUBATOR_PASSWORD}
       RELAY_TOKEN: ${RELAY_TOKEN}
       CAMERA_URL: ${CAMERA_URL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TO: ${SMTP_TO:-}
+      SMTP_TLS: ${SMTP_TLS:-starttls}
+      INCUBATOR_URL: ${INCUBATOR_URL:-https://incubator.waterbear.studio}
     volumes:
       # Dokploy efface le clone git à chaque déploiement. ../files reste.
       - ../files/incubator:/data

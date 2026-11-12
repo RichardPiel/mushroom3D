@@ -25,7 +25,10 @@ L’appli actuelle `incubateur-ui-…` est une **Application** (chemin
 2. Provider GitHub, repo `mushroom3D`, branche `main`
 3. **Compose Path** : `./docker-compose.yml` (comme dans la [doc Dokploy](https://docs.dokploy.com/docs/core/docker-compose/example), sans slash final)
 4. Variables : `INCUBATOR_PASSWORD`, `RELAY_TOKEN`, optionnellement `CAMERA_URL`
-5. Domaines → service `incubator`, port **8765**
+5. Alerte BME : `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TO`, `SMTP_TLS` (`starttls`, `ssl` ou `none`), `INCUBATOR_URL`
+
+Sans `SMTP_HOST`, aucun mail n'est envoyé. Une perte de température ou d'humidité BME (60 s) déclenche un mail, deux au plus par heure. Le message contient `INCUBATOR_URL`. Modèle : `.env.example`.
+6. Domaines → service `incubator`, port **8765**
 
 Ne pas réutiliser l’ancienne Application Nixpacks/Dockerfile.
 

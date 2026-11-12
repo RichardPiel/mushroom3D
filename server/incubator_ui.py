@@ -22,6 +22,7 @@ import mimetypes
 import os
 import secrets
 import shutil
+import smtplib
 import threading
 import time
 import urllib.error
@@ -29,6 +30,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -122,6 +124,12 @@ FORECAST_MIN_S = 60
 FORECAST_MAX_S = 1800
 AIR_RATE_MIN_SPAN_S = 45.0
 AIR_RATE_MAX = 0.03
+# Mesure BME absente depuis ce délai → une alerte, pas à chaque échantillon.
+BME_LOST_AFTER_S = 60.0
+BME_ALERT_LIMIT = 2
+BME_ALERT_WINDOW_S = 3600.0
+BME_ALERT_RETRY_S = 60.0
+DEFAULT_INCUBATOR_URL = "https://incubator.waterbear.studio"
 HEAT_I_MAX = 12.0 / AIR_KI
 HEAT_I_MIN = -15.0 / AIR_KI
 
@@ -247,6 +255,136 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _header_value(raw: str) -> str:
+    return raw.replace("\r", " ").replace("\n", " ").strip()
+
+
+def _finite_float(raw: Any) -> float | None:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _bme_reading_ok(bme: dict[str, Any]) -> bool:
+    if not bme.get("ok"):
+        return False
+    temp = _finite_float(bme.get("temperature_c"))
+    hum = _finite_float(bme.get("humidity_pct"))
+    if temp is None or hum is None:
+        return False
+    return AIR_SANE_MIN <= temp <= AIR_SANE_MAX and 0.0 <= hum <= 100.0
+
+
+def smtp_config() -> dict[str, Any] | None:
+    """None si l'envoi n'est pas configuré. Lu à chaque alerte, pas au démarrage."""
+    host = _header_value(os.environ.get("SMTP_HOST", ""))
+    sender = _header_value(os.environ.get("SMTP_FROM", ""))
+    recipients = [
+        _header_value(part)
+        for part in os.environ.get("SMTP_TO", "").replace(";", ",").split(",")
+        if _header_value(part)
+    ]
+    if not host or not sender or not recipients:
+        return None
+    try:
+        port = int((os.environ.get("SMTP_PORT") or "587").strip())
+    except ValueError:
+        port = 587
+    tls = (os.environ.get("SMTP_TLS") or "starttls").strip().lower()
+    if tls not in ("starttls", "ssl", "none"):
+        tls = "starttls"
+    url = _header_value(os.environ.get("INCUBATOR_URL", "")) or DEFAULT_INCUBATOR_URL
+    return {
+        "host": host,
+        "port": port,
+        "user": _header_value(os.environ.get("SMTP_USER", "")),
+        "password": os.environ.get("SMTP_PASSWORD", ""),
+        "from": sender,
+        "to": recipients,
+        "tls": tls,
+        "url": url.rstrip("/"),
+    }
+
+
+def bme_alert_budget(sent: list[float], now: float) -> list[float]:
+    """Horodatages encore dans l'heure glissante."""
+    return [stamp for stamp in sent if now - stamp < BME_ALERT_WINDOW_S]
+
+
+def _fr_num(value: float) -> str:
+    return f"{value:.1f}".replace(".", ",")
+
+
+def _ago_fr(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total} s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} min" if secs < 30 else f"{minutes + 1} min"
+    hours, minutes = divmod(minutes, 60)
+    if minutes == 0:
+        return f"{hours} h"
+    return f"{hours} h {minutes} min"
+
+
+def bme_alert_message(
+    *,
+    url: str,
+    last: dict[str, float] | None,
+    last_wall: float | None,
+    now: float,
+    relay_online: bool,
+    relay_age_s: float | None,
+) -> tuple[str, str]:
+    lines = ["Le capteur BME680 ne renvoie plus de température ni d'humidité.", ""]
+    if last is not None and last_wall is not None:
+        lines.append(
+            "Dernière mesure : "
+            f"{_fr_num(last['temperature_c'])} °C, "
+            f"{_fr_num(last['humidity_pct'])} % d'humidité, "
+            f"il y a {_ago_fr(now - last_wall)}."
+        )
+    else:
+        lines.append("Aucune mesure valide n'a été reçue.")
+    if relay_age_s is None:
+        lines.append("Le relais ne s'est pas encore connecté.")
+    elif relay_online:
+        lines.append("Le relais est en ligne, mais le capteur ne répond plus.")
+    else:
+        lines.append(f"Le relais est hors ligne depuis {_ago_fr(relay_age_s)}.")
+    lines.extend(["", url])
+    return "Incubateur — plus de mesures BME680", "\n".join(lines)
+
+
+def send_bme_alert(cfg: dict[str, Any], subject: str, body: str) -> None:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = cfg["from"]
+    msg["To"] = ", ".join(cfg["to"])
+    msg.set_content(body)
+    if cfg["tls"] == "ssl":
+        smtp: smtplib.SMTP = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20)
+    else:
+        smtp = smtplib.SMTP(cfg["host"], cfg["port"], timeout=20)
+    try:
+        smtp.ehlo()
+        if cfg["tls"] == "starttls":
+            smtp.starttls()
+            smtp.ehlo()
+        if cfg["user"]:
+            smtp.login(cfg["user"], cfg["password"])
+        smtp.send_message(msg)
+    finally:
+        try:
+            smtp.quit()
+        except Exception:
+            pass
 
 
 def _cfg_float(cfg: dict[str, Any], key: str, default: float) -> float:
@@ -502,6 +640,15 @@ class IncubatorController:
             "pressure_hpa": None,
             "gas_ohms": None,
         }
+        self._boot_mono = time.monotonic()
+        self._bme_ok_at = 0.0
+        self._bme_last_good: dict[str, float] | None = None
+        self._bme_last_good_wall: float | None = None
+        self._bme_alert_sent: list[float] = []
+        self._bme_down = False
+        self._bme_alert_retry_at = 0.0
+        self._bme_hold_logged = False
+        self._bme_smtp_warned = False
         self.link_seen_at = 0.0
         self.commands: deque[dict[str, Any]] = deque()
         self._stop = threading.Event()
@@ -567,6 +714,10 @@ class IncubatorController:
             "machine_name": self.machine_name,
             "firmware": self.firmware,
             "bme680": dict(self.bme680),
+            "bme_last_good": None if self._bme_last_good is None else dict(self._bme_last_good),
+            "bme_last_good_wall": self._bme_last_good_wall,
+            "bme_alert_sent": list(self._bme_alert_sent),
+            "bme_alert_open": self._bme_down,
             "air_wall": [[wall, temp] for wall, temp in self._air_wall],
         }
 
@@ -665,6 +816,29 @@ class IncubatorController:
             self.firmware = state["firmware"]
         if isinstance(state.get("bme680"), dict):
             self.bme680.update(state["bme680"])
+        good = state.get("bme_last_good")
+        if isinstance(good, dict):
+            temp = _finite_float(good.get("temperature_c"))
+            hum = _finite_float(good.get("humidity_pct"))
+            try:
+                wall = float(state.get("bme_last_good_wall"))
+            except (TypeError, ValueError):
+                wall = None
+            if temp is not None and hum is not None and wall is not None:
+                self._bme_last_good = {"temperature_c": temp, "humidity_pct": hum}
+                self._bme_last_good_wall = wall
+        sent = state.get("bme_alert_sent")
+        if isinstance(sent, list):
+            now_sent = time.time()
+            kept: list[float] = []
+            for item in sent:
+                stamp = _finite_float(item)
+                if stamp is not None and now_sent - stamp < BME_ALERT_WINDOW_S:
+                    kept.append(stamp)
+            self._bme_alert_sent = kept
+        self._bme_down = bool(state.get("bme_alert_open"))
+        if _bme_reading_ok(self.bme680):
+            self._bme_ok_at = time.monotonic()
         if state.get("last_photo_wall") is not None:
             try:
                 age = max(0.0, time.time() - float(state["last_photo_wall"]))
@@ -1009,6 +1183,7 @@ class IncubatorController:
                 "pressure_hpa": bme.get("pressure_hpa"),
                 "gas_ohms": bme.get("gas_ohms"),
             }
+            self._note_bme_sample()
 
             if "heater_on" in desired:
                 self.heater_on = bool(desired["heater_on"])
@@ -1658,11 +1833,103 @@ class IncubatorController:
             self.last_error = ""
             return self.status()
 
+    def _note_bme_sample(self) -> None:
+        """Caller holds self.lock. Une mesure valide clôt l'épisode d'alerte."""
+        if not _bme_reading_ok(self.bme680):
+            return
+        self._bme_ok_at = time.monotonic()
+        self._bme_last_good = {
+            "temperature_c": float(self.bme680["temperature_c"]),
+            "humidity_pct": float(self.bme680["humidity_pct"]),
+        }
+        self._bme_last_good_wall = time.time()
+        self._bme_down = False
+        self._bme_hold_logged = False
+
+    def _bme_lost(self) -> bool:
+        """Caller holds self.lock."""
+        anchor = self._bme_ok_at or self._boot_mono
+        return time.monotonic() - anchor >= BME_LOST_AFTER_S
+
+    def _tick_bme_alert(self) -> None:
+        with self.lock:
+            if not self._bme_lost():
+                return
+            if self._bme_down or time.monotonic() < self._bme_alert_retry_at:
+                return
+            cfg = smtp_config()
+            if cfg is None:
+                if not self._bme_smtp_warned:
+                    log.warning("Alerte BME non envoyée : SMTP_HOST, SMTP_FROM ou SMTP_TO manquant")
+                    self._bme_smtp_warned = True
+                return
+            now = time.time()
+            self._bme_alert_sent = bme_alert_budget(self._bme_alert_sent, now)
+            if len(self._bme_alert_sent) >= BME_ALERT_LIMIT:
+                if not self._bme_hold_logged:
+                    log.warning("Alerte BME retenue : déjà %s envois dans l'heure", BME_ALERT_LIMIT)
+                    self._bme_hold_logged = True
+                return
+            age = (now - self.link_seen_at) if self.link_seen_at else None
+            subject, body = bme_alert_message(
+                url=cfg["url"],
+                last=None if self._bme_last_good is None else dict(self._bme_last_good),
+                last_wall=self._bme_last_good_wall,
+                now=now,
+                relay_online=age is not None and age < LINK_STALE_S,
+                relay_age_s=age,
+            )
+            recipients = list(cfg["to"])
+        try:
+            send_bme_alert(cfg, subject, body)
+        except Exception:
+            log.exception("Envoi de l'alerte BME impossible")
+            with self.lock:
+                self._bme_alert_retry_at = time.monotonic() + BME_ALERT_RETRY_S
+            return
+        with self.lock:
+            self._bme_alert_sent.append(time.time())
+            self._bme_alert_sent = bme_alert_budget(self._bme_alert_sent, time.time())
+            self._bme_down = True
+            self._bme_hold_logged = False
+            self._persist_runtime()
+        log.info("Alerte BME envoyée à %s", ", ".join(recipients))
+
+    def send_test_mail(self) -> dict[str, Any]:
+        """Même canal et même quota que l'alerte automatique. Ne change pas l'épisode en cours."""
+        cfg = smtp_config()
+        if cfg is None:
+            return {"ok": False, "status": 400, "error": "SMTP incomplet : renseigner SMTP_HOST, SMTP_FROM et SMTP_TO"}
+        with self.lock:
+            now = time.time()
+            self._bme_alert_sent = bme_alert_budget(self._bme_alert_sent, now)
+            if len(self._bme_alert_sent) >= BME_ALERT_LIMIT:
+                return {"ok": False, "status": 429, "error": "Déjà 2 e-mails dans l'heure"}
+            self._bme_alert_sent.append(now)
+        subject = "Test SMTP incubateur"
+        body = "Essai d'envoi.\nLe canal SMTP de l'incubateur fonctionne.\n\n" + cfg["url"]
+        try:
+            send_bme_alert(cfg, subject, body)
+        except Exception as exc:
+            log.exception("Essai SMTP impossible")
+            with self.lock:
+                try:
+                    self._bme_alert_sent.remove(now)
+                except ValueError:
+                    pass
+            return {"ok": False, "status": 502, "error": f"Envoi impossible : {exc}"}
+        with self.lock:
+            self._persist_runtime()
+        to = ", ".join(cfg["to"])
+        log.info("Essai SMTP envoyé à %s", to)
+        return {"ok": True, "status": 200, "to": to}
+
     def _scheduler(self) -> None:
         while not self._stop.is_set():
             try:
                 self._tick_sun()
                 self._tick_photos()
+                self._tick_bme_alert()
                 with self.lock:
                     if self.incubator_running:
                         self._drive_cycle_fan(self._air_c())
@@ -1932,6 +2199,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: rgba(255,107,90,.12); color: #ffd0ca; font-size: .84rem; display: none;
   }
   .err.show { display: block; }
+  .mail-test { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; }
+  .mail-note { margin: 0; font-size: .84rem; color: var(--muted); }
+  .mail-note.ok { color: var(--ok); }
+  .mail-note.bad { color: #ffd0ca; }
 
   .below { display: grid; gap: 14px; margin-top: 14px; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
@@ -2077,6 +2348,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
           </div>
 
           <div class="err" id="err"></div>
+          <div class="mail-test">
+            <button type="button" class="btn-ghost" id="btnTestMail">Envoyer un e-mail d'essai</button>
+            <p class="mail-note" id="mailNote" role="status"></p>
+          </div>
         </div>
       </section>
     </div>
@@ -2830,6 +3105,23 @@ $("cfgForm").onsubmit = async (ev) => {
   }
 };
 
+$("btnTestMail").onclick = async () => {
+  const note = $("mailNote");
+  const btn = $("btnTestMail");
+  btn.disabled = true;
+  note.className = "mail-note";
+  note.textContent = "Envoi…";
+  try {
+    const r = await api("/api/alert/test", { method: "POST", body: "{}" });
+    note.className = "mail-note ok";
+    note.textContent = r.to ? `Envoyé à ${r.to}` : "Envoyé";
+  } catch (e) {
+    note.className = "mail-note bad";
+    note.textContent = String(e.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+};
 $("btnSnap").onclick = async () => {
   const r = await api("/api/snapshot", { method: "POST", body: "{}" });
   if (!r.ok) showErr(r.error || "Échec");
@@ -3184,6 +3476,10 @@ class Handler(BaseHTTPRequestHandler):
                         duration_s=body.get("duration_s"),
                     ),
                 )
+            if path == "/api/alert/test":
+                result = CTRL.send_test_mail()
+                status = int(result.pop("status", 200 if result.get("ok") else 502))
+                return self._json(status, result)
             if path == "/api/snapshot":
                 return self._json(200, CTRL.take_snapshot())
         except ValueError as exc:
@@ -3205,6 +3501,10 @@ def main() -> int:
     else:
         log.warning("RELAY_TOKEN vide — la carte ESP32 ne pourra pas s'authentifier")
     log.info("URL caméra : %s", CTRL.camera_url)
+    if smtp_config():
+        log.info("Alerte BME activée (%s envois max par heure)", BME_ALERT_LIMIT)
+    else:
+        log.warning("Alerte BME désactivée — renseigner SMTP_HOST, SMTP_FROM et SMTP_TO")
     log.info("Démarrage UI sur http://127.0.0.1:%s", UI_PORT)
     CTRL.start()
     server = ThreadingHTTPServer((UI_HOST, UI_PORT), Handler)
